@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Flask
+instance/
+.webassets-cache
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+
+# Project generated content
+uploads/
+outputs/
+cache/
+data/reports/
+
+# Optional local data files
+*.csv
+*.xlsx
+*.xls
+*.geojson
+
+# Build / coverage
+build/
+dist/
+*.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+
+# Render
+.render/
+Pdf_Report_Generator/
+
+
+data/reports/
+
+data/
+
+
+cache/

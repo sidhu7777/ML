@@ -1,0 +1,35 @@
+# From .gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+instance/
+.webassets-cache
+.env
+.env.local
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+uploads/
+outputs/
+logs/
+*.log
+*.csv
+*.xlsx
+*.xls
+*.geojson
+.render/
+tmp/
+temp/
+*.tmp
+
+# Docker specific
+Dockerfile
+.dockerignore

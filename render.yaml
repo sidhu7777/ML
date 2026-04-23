@@ -1,0 +1,31 @@
+services:
+  # Main Backend API
+  - type: web
+    name: multi-tool-backend
+    env: docker  # <-- CHANGED
+    region: oregon
+    plan: starter
+    # buildCommand and startCommand are now in the Dockerfile
+    # Playwright install is handled in Dockerfile. If you switch off docker,
+    # add: buildCommand: "pip install -r requirements.txt && playwright install --with-deps chromium"
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: SECRET_KEY
+        generateValue: true
+      - key: MAX_CONTENT_LENGTH
+        value: 104857600  # 100MB
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: OSM_TIMEOUT
+        value: 180
+      - key: OSM_USE_CACHE
+        value: "true"
+      # Add these from Render dashboard (secret):
+      # - AWS_ACCESS_KEY_ID
+      # - AWS_SECRET_ACCESS_KEY
+      # - S3_BUCKET_NAME
+    
+    healthCheckPath: /health
+    
+    autoDeploy: true

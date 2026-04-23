@@ -1,0 +1,1021 @@
+from altair import value
+import folium
+from shapely.wkt import loads
+import colorsys
+import json
+import pandas as pd
+import math
+import os
+
+# Helper function to add legend to folium map
+
+def add_fullscreen_css(m):
+    css = """
+    <style>
+        html, body { width: 100%; height: 100%; margin: 0; padding: 0; }
+        .folium-map { width: 100% !important; height: 100% !important; position: relative; }
+    </style>
+    """
+    m.get_root().header.add_child(folium.Element(css))
+
+
+def add_legend(m, title, items):
+    """
+    items = [(label, color, count)]
+    """
+    # Style is added to <head>; legend is injected into the map div so
+    # Playwright clipping to the map captures the legend.
+    legend_css = """
+    <style>
+        .kpi-legend {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 320px;
+            max-height: calc(100% - 40px);
+            overflow: auto;
+            z-index: 9999;
+            background-color: rgba(255, 255, 255, 0.98);
+            color: #000;
+            padding: 18px 16px;
+            border-radius: 8px;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            font-size: 18px;
+            line-height: 1.6;
+            box-shadow: 0px 4px 12px rgba(0,0,0,0.3);
+            border: 2px solid rgba(0,0,0,0.15);
+        }
+        .kpi-legend-title {
+            font-weight: 700;
+            font-size: 20px;
+            margin-bottom: 12px;
+            color: #000;
+            border-bottom: 2px solid #333;
+            padding-bottom: 8px;
+        }
+        .kpi-legend-row {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            font-size: 18px;
+        }
+        .kpi-legend-swatch {
+            width: 22px;
+            height: 22px;
+            border-radius: 3px;
+            margin-right: 10px;
+            flex: 0 0 auto;
+            border: 1px solid rgba(0,0,0,0.2);
+        }
+    </style>
+    """
+    m.get_root().header.add_child(folium.Element(legend_css))
+
+    rows_html = ""
+    for label, color, count in items:
+        rows_html += (
+            f"<div class='kpi-legend-row'>"
+            f"<span class='kpi-legend-swatch' style='background:{color};'></span>"
+            f"<span>{label} : {count}</span>"
+            f"</div>"
+        )
+
+    legend_inner_html = (
+        f"<div class='kpi-legend'>"
+        f"<div class='kpi-legend-title'>{title}</div>"
+        f"{rows_html}"
+        f"</div>"
+    )
+
+    payload = json.dumps(legend_inner_html)
+    legend_js = f"""
+    <script>
+        (function() {{
+            function injectLegend() {{
+                var mapEl = document.querySelector('.folium-map');
+                if (!mapEl) return;
+                mapEl.style.position = 'relative';
+                var existing = mapEl.querySelector('.kpi-legend');
+                if (existing) existing.remove();
+                var wrapper = document.createElement('div');
+                wrapper.innerHTML = {payload};
+                mapEl.appendChild(wrapper.firstElementChild);
+            }}
+            setTimeout(injectLegend, 250);
+        }})();
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(legend_js))
+
+
+
+
+
+# heper function to get polygon bounds
+
+
+def get_polygon_bounds(polygon_wkt):
+    geom = loads(polygon_wkt)
+    
+    # WKT standard format is (lon, lat) from MySQL ST_AsText
+    # Extract coordinates: shapely returns (x, y) = (lon, lat)
+    coords = list(geom.exterior.coords)
+    lons = [coord[0] for coord in coords]
+    lats = [coord[1] for coord in coords]
+
+    min_lat = min(lats)
+    max_lat = max(lats)
+    min_lon = min(lons)
+    max_lon = max(lons)
+
+    return [
+        [min_lat, min_lon],
+        [max_lat, max_lon],
+    ]
+
+
+def get_df_bounds(df):
+    df = df.dropna(subset=["lat", "lon"])
+    if df.empty:
+        raise ValueError("No GPS data to compute bounds")
+    return [
+        [float(df["lat"].min()), float(df["lon"].min())],
+        [float(df["lat"].max()), float(df["lon"].max())],
+    ]
+
+
+def merge_bounds(b1, b2):
+    return [
+        [min(b1[0][0], b2[0][0]), min(b1[0][1], b2[0][1])],
+        [max(b1[1][0], b2[1][0]), max(b1[1][1], b2[1][1])],
+    ]
+
+
+def force_zoom_in(m, zoom_delta=2):
+    """
+    Force zoom-in AFTER fit_bounds.
+    zoom_delta = how many levels to zoom in.
+    """
+    script = f"""
+    <script>
+        setTimeout(function() {{
+            var el = document.querySelector('.folium-map');
+            var mapId = el && el.id;
+            var map = mapId && window[mapId];
+            if (map && typeof map.getZoom === 'function') {{
+                map.setZoom(map.getZoom() + {zoom_delta});
+            }}
+        }}, 300);
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(script))
+
+
+def expand_bounds(bounds, expand_factor=0.02):
+    """
+    Expands bounds by a small percentage to avoid clipping.
+    bounds = [[min_lat, min_lon], [max_lat, max_lon]]
+    Reduced factor to minimize white space.
+    """
+
+    min_lat, min_lon = bounds[0]
+    max_lat, max_lon = bounds[1]
+
+    lat_range = max_lat - min_lat
+    lon_range = max_lon - min_lon
+
+    return [
+        [min_lat - lat_range * expand_factor,
+         min_lon - lon_range * expand_factor],
+        [max_lat + lat_range * expand_factor,
+         max_lon + lon_range * expand_factor],
+    ]
+
+
+
+# Helper function to build legend items from color function
+
+def value_in_range(value, range_dict, is_last_range):
+    """
+    Check if value belongs to range using half-open intervals.
+    - All ranges except last: min <= value < max
+    - Last range: min <= value <= max
+    This prevents double-counting at boundaries.
+    """
+    if is_last_range:
+        return range_dict["min"] <= value <= range_dict["max"]
+    else:
+        return range_dict["min"] <= value < range_dict["max"]
+
+
+def build_legend_from_ranges(df, kpi_column, ranges):
+    legend_items = []
+
+    values = pd.to_numeric(df[kpi_column], errors="coerce").dropna()
+    if values.empty:
+        return []
+
+    for idx, r in enumerate(ranges):
+        is_last = (idx == len(ranges) - 1)
+        mask = values.apply(lambda v: value_in_range(v, r, is_last))
+        count = int(mask.sum())
+
+        if count == 0:
+            continue
+
+        label = r.get("range") or f'{r["min"]} to {r["max"]}'
+        color = r["color"]
+
+        legend_items.append((label, color, count))
+
+    return legend_items
+
+
+
+# Data validation functions 
+
+def has_valid_numeric_data(df: pd.DataFrame, column: str) -> bool:
+    if column not in df.columns:
+        return False
+
+    values = pd.to_numeric(df[column], errors="coerce")
+    return values.notna().any()
+
+
+def has_valid_categorical_data(df: pd.DataFrame, column: str) -> bool:
+    if column not in df.columns:
+        return False
+
+    return df[column].dropna().astype(str).str.strip().ne("").any()
+
+
+
+# Debug map generation function
+
+def generate_debug_map(df, polygon_wkt, output_path, sample_points=50):
+    """
+    Debug map to visually inspect:
+    - GPS route
+    - Polygon shape
+    - Polygon vertex points
+    """
+
+    df = df.dropna(subset=["Latitude", "Longitude"])
+
+    if df.empty:
+        raise ValueError("No GPS data to plot")
+
+    # Center map on GPS data
+    m = folium.Map(
+        tiles="CartoDB positron",  # cleaner than OSM
+        zoom_control=True,
+        control_scale=False,
+        prefer_canvas=True
+    )
+
+    add_fullscreen_css(m)
+
+    # 1 GPS route (BLUE)
+    folium.PolyLine(
+        locations=list(zip(df["lat"], df["lon"])),
+        color="blue",
+        weight=3,
+        opacity=0.7,
+        tooltip="GPS Route"
+    ).add_to(m)
+
+    
+
+    # 2 Polygon boundary + vertices
+    geom = loads(polygon_wkt)
+
+    # WKT format is (lon, lat), convert to (lat, lon) for folium
+    polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
+
+    # Polygon outline (RED)
+    folium.Polygon(
+        locations=polygon_latlon,
+        color="red",
+        weight=4,
+        fill=False,
+        tooltip="Polygon Boundary"
+    ).add_to(m)
+
+    # 3 Polygon vertex markers (NUMBERED)
+    for idx, (lat, lon) in enumerate(polygon_latlon):
+        folium.Marker(
+            location=(lat, lon),
+            popup=f"Vertex {idx}\nLat: {lat}\nLon: {lon}",
+            icon=folium.DivIcon(
+                html=f"""
+                <div style="
+                    font-size: 10px;
+                    color: red;
+                    font-weight: bold;
+                ">
+                    {idx}
+                </div>
+                """
+            )
+        ).add_to(m)
+
+    # Fit view to polygon + route with minimal padding
+    bounds = merge_bounds(get_df_bounds(df), get_polygon_bounds(polygon_wkt))
+    bounds = expand_bounds(bounds, expand_factor=0.02)
+    m.fit_bounds(bounds, max_zoom=18)
+
+    m.save(output_path)
+
+
+# KPI map generation function
+
+def generate_kpi_map(df, kpi_column, color_func,ranges, output_html, polygon_wkt=None):
+    # Drop rows with missing lat/lon or KPI values
+    df = df.dropna(subset=["lat", "lon", kpi_column])
+
+    if df.empty:
+        raise ValueError("No data available for KPI map")
+
+    m = folium.Map(
+        tiles="CartoDB positron",  # cleaner than OSM
+        zoom_control=True,
+        control_scale=False,
+        prefer_canvas=True
+    )
+
+    add_fullscreen_css(m)
+
+    for _, row in df.iterrows():
+        
+
+        raw_value = row[kpi_column]
+
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+
+        # Find color using half-open intervals
+        color = "#808080"  # default gray
+        for idx, r in enumerate(ranges):
+            is_last = (idx == len(ranges) - 1)
+            if value_in_range(value, r, is_last):
+                color = r["color"]
+                break
+
+        folium.CircleMarker(
+            location=(row["lat"], row["lon"]),
+            radius=4,
+            color=color,
+            fill=True,
+            fill_opacity=0.9
+        ).add_to(m)
+
+    # 4 Build legend
+
+    legend_items = build_legend_from_ranges(df, kpi_column, ranges)
+    add_legend(m, kpi_column, legend_items)
+    
+    # 5 Add polygon boundary on top for visibility
+    if polygon_wkt:
+        geom = loads(polygon_wkt)
+        # WKT format is (lon, lat), convert to (lat, lon) for folium
+        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
+
+        folium.Polygon(
+            locations=polygon_latlon,
+            color="#FF0000",  # Bright red
+            weight=5,
+            fill=False,
+            opacity=1.0,
+            tooltip="Polygon Boundary"
+        ).add_to(m)
+    
+    # Fit view tightly to data + polygon with minimal padding
+    bounds = get_df_bounds(df)
+    if polygon_wkt:
+        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
+    
+    # Minimal expansion - only 2% to avoid clipping
+    bounds = expand_bounds(bounds, expand_factor=0.02)
+    
+    # Tight padding: small left/top, room for legend on right
+    m.fit_bounds(
+        bounds,
+        padding_top_left=(20, 20),
+        padding_bottom_right=(320, 20),
+        max_zoom=18
+    )
+    
+    m.save(output_html)
+
+
+
+# Helper function to generate distinct colors
+
+def generate_distinct_colors(n):
+    """
+    Generate n visually distinct colors using HSV space.
+    Returns a list of hex color strings.
+    """
+    colors = []
+    for i in range(n):
+        hue = i / n
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.85, 0.85)
+        colors.append(
+            "#{:02x}{:02x}{:02x}".format(
+                int(r * 255),
+                int(g * 255),
+                int(b * 255)
+            )
+        )
+    return colors
+
+# Categorical KPI map generation function
+
+def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
+    """
+    Categorical KPI map for Band / PCI:
+    - Unlimited unique values
+    - Dynamically generated distinct colors
+    """
+
+    df = df.dropna(subset=["lat", "lon", kpi_column])
+
+    if df.empty:
+        raise ValueError(f"No data available for categorical KPI: {kpi_column}")
+
+    m = folium.Map(
+        tiles="CartoDB positron",  # cleaner than OSM
+        zoom_control=True,
+        control_scale=False,
+        prefer_canvas=True
+    )
+
+    add_fullscreen_css(m)
+
+    # 1 Get unique categorical values
+    unique_values = sorted(df[kpi_column].unique())
+
+    # 2 Generate distinct colors dynamically
+    colors = generate_distinct_colors(len(unique_values))
+
+    value_color_map = {
+        val: colors[i]
+        for i, val in enumerate(unique_values)
+    }
+
+    # 3 Plot points
+    for _, row in df.iterrows():
+        value = row[kpi_column]
+
+        if value not in value_color_map:
+            continue
+
+        color = value_color_map[value]
+
+
+        folium.CircleMarker(
+            location=(row["lat"], row["lon"]),
+            radius=4,
+            color=value_color_map[value],
+            fill=True,
+            fill_opacity=0.9,
+            tooltip=f"{kpi_column}: {value}"
+        ).add_to(m)
+
+    
+    # 4 Build legend with top N categories + "Others"
+    value_counts = df[kpi_column].value_counts()
+
+    top_n = 6
+    legend_items = []
+    for val, count in value_counts.head(top_n).items():
+        
+        legend_items.append((str(val), value_color_map[val], count))
+
+    others = value_counts.iloc[top_n:].sum()
+    if others > 0:
+        legend_items.append(("Others", "#999999", others))
+    add_legend(m, kpi_column, legend_items)
+    
+    # Add polygon boundary on top for visibility
+    if polygon_wkt:
+        geom = loads(polygon_wkt)
+        # WKT format is (lon, lat), convert to (lat, lon) for folium
+        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
+
+        folium.Polygon(
+            locations=polygon_latlon,
+            color="#FF0000",  # Bright red
+            weight=5,
+            fill=False,
+            opacity=1.0,
+            tooltip="Polygon Boundary"
+        ).add_to(m)
+    
+    # Fit view tightly to data + polygon with minimal padding
+    bounds = get_df_bounds(df)
+    if polygon_wkt:
+        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
+    
+    # Minimal expansion - only 2% to avoid clipping
+    bounds = expand_bounds(bounds, expand_factor=0.02)
+    
+    # Tight padding: small left/top, room for legend on right
+    m.fit_bounds(
+        bounds,
+        padding_top_left=(20, 20),
+        padding_bottom_right=(320, 20),
+        max_zoom=18
+    )
+    
+    m.save(output_html)
+
+
+# =====================================================
+# POOR REGION MAPS (RSRP / RSRQ) - PNG OUTPUT
+# =====================================================
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """Distance between two lat/lon points in meters."""
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _select_non_overlapping_regions(candidates, min_distance_meters, top_regions):
+    selected = []
+    for cand in candidates:
+        too_close = False
+        for sel in selected:
+            d = _haversine_m(cand["lat"], cand["lon"], sel["lat"], sel["lon"])
+            if d < min_distance_meters:
+                too_close = True
+                break
+        if not too_close:
+            selected.append(cand)
+        if len(selected) == top_regions:
+            break
+    return selected
+
+
+def detect_handover_events(df: pd.DataFrame, use_global_detection=True, min_run_length=3):
+    """
+    Detect provider/technology handover events from a dataframe with columns:
+    ['timestamp','lat','lon','m_alpha_long','session_id', ...]
+    Returns list of events with keys: session_id,timestamp,lat,lon,from_provider,to_provider,from_network,to_network
+    """
+    events = []
+    if df is None or df.empty:
+        return events
+
+    df = df.rename(columns={c: c.lower() for c in df.columns})
+
+    tech_col = None
+    for cand in ("network", "technology", "tech"):
+        if cand in df.columns:
+            tech_col = cand
+            break
+
+    required = {"timestamp", "lat", "lon", "m_alpha_long"}
+    if tech_col:
+        required.add(tech_col)
+    if not required.issubset(set(df.columns)):
+        return events
+
+    df = df.dropna(subset=["lat", "lon", "m_alpha_long"] + ([tech_col] if tech_col else []))
+
+    MIN_RUN_LENGTH = min_run_length
+
+    # per-session detection
+    if "session_id" in df.columns:
+        df_s = df.sort_values(["session_id", "timestamp"]) 
+        for sid, group in df_s.groupby("session_id"):
+            runs = []
+            prev = None
+            count = 0
+            first_row = None
+            for _, row in group.iterrows():
+                prov = str(row["m_alpha_long"]).strip()
+                tech = str(row[tech_col]).strip() if tech_col else None
+                key = (prov, tech)
+                if prev is None:
+                    prev = key
+                    count = 1
+                    first_row = row
+                    continue
+                if key == prev:
+                    count += 1
+                else:
+                    runs.append((prev, first_row, count))
+                    prev = key
+                    count = 1
+                    first_row = row
+            if prev is not None:
+                runs.append((prev, first_row, count))
+
+            for i in range(len(runs) - 1):
+                (cur_prov, cur_tech), cur_row, cur_cnt = runs[i]
+                (next_prov, next_tech), next_row, next_cnt = runs[i + 1]
+                if (next_prov != cur_prov or next_tech != cur_tech) and next_cnt >= MIN_RUN_LENGTH:
+                    events.append({
+                        "session_id": int(sid),
+                        "timestamp": next_row["timestamp"],
+                        "lat": float(next_row["lat"]),
+                        "lon": float(next_row["lon"]),
+                        "from_provider": cur_prov,
+                        "to_provider": next_prov,
+                        "from_network": cur_tech,
+                        "to_network": next_tech,
+                    })
+
+        # relaxed detection (min_run=1) if none found
+        if not events:
+            events_relaxed = []
+            for sid, group in df_s.groupby("session_id"):
+                prev = None
+                for _, row in group.iterrows():
+                    prov = str(row["m_alpha_long"]).strip()
+                    tech = str(row[tech_col]).strip() if tech_col else None
+                    key = (prov, tech)
+                    if prev is None:
+                        prev = key
+                        continue
+                    if key != prev:
+                        events_relaxed.append({
+                            "session_id": int(sid),
+                            "timestamp": row["timestamp"],
+                            "lat": float(row["lat"]),
+                            "lon": float(row["lon"]),
+                            "from_provider": prev[0],
+                            "to_provider": prov,
+                            "from_network": prev[1],
+                            "to_network": tech,
+                        })
+                        prev = key
+            events = events_relaxed
+
+    # if global detection requested or no session_id
+    if use_global_detection or "session_id" not in df.columns:
+        df_g = df.sort_values(["timestamp"])  # time-ordered
+        runs = []
+        prev = None
+        count = 0
+        first_row = None
+        for _, row in df_g.iterrows():
+            prov = str(row["m_alpha_long"]).strip()
+            tech = str(row[tech_col]).strip() if tech_col else None
+            key = (prov, tech)
+            if prev is None:
+                prev = key
+                count = 1
+                first_row = row
+                continue
+            if key == prev:
+                count += 1
+            else:
+                runs.append((prev, first_row, count))
+                prev = key
+                count = 1
+                first_row = row
+        if prev is not None:
+            runs.append((prev, first_row, count))
+
+        for i in range(len(runs) - 1):
+            (cur_prov, cur_tech), cur_row, cur_cnt = runs[i]
+            (next_prov, next_tech), next_row, next_cnt = runs[i + 1]
+            if (next_prov != cur_prov or next_tech != cur_tech) and next_cnt >= MIN_RUN_LENGTH:
+                events.append({
+                    "session_id": int(next_row.get("session_id")) if next_row.get("session_id") is not None else None,
+                    "timestamp": next_row["timestamp"],
+                    "lat": float(next_row["lat"]),
+                    "lon": float(next_row["lon"]),
+                    "from_provider": cur_prov,
+                    "to_provider": next_prov,
+                    "from_network": cur_tech,
+                    "to_network": next_tech,
+                })
+
+    # deduplicate
+    unique = []
+    seen = set()
+    for ev in events:
+        k = (str(ev.get('timestamp')), round(float(ev.get('lat')), 6), round(float(ev.get('lon')), 6), ev.get('from_provider'), ev.get('to_provider'))
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(ev)
+
+    return unique
+
+
+def _build_region_candidates(poor_df, grid_size):
+    tmp = poor_df.copy()
+    tmp["lat_bin"] = (tmp["lat"] / grid_size).round().astype(int)
+    tmp["lon_bin"] = (tmp["lon"] / grid_size).round().astype(int)
+
+    grid_counts = (
+        tmp.groupby(["lat_bin", "lon_bin"])
+        .size()
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+    )
+
+    candidates = []
+    for _, r in grid_counts.iterrows():
+        cell = tmp[(tmp.lat_bin == r.lat_bin) & (tmp.lon_bin == r.lon_bin)]
+        candidates.append({
+            "lat": cell.lat.mean(),
+            "lon": cell.lon.mean(),
+            "count": int(r["count"]),
+            "points": cell
+        })
+
+    return candidates
+
+
+def generate_poor_region_map(
+    filtered_df,
+    value_col,
+    threshold,
+    output_png,
+    tmp_html,
+    title,
+    polygon_wkt=None,
+    grid_size=0.0012,
+    top_regions=5,
+    min_distance_meters=400,
+    point_radius=2,
+    region_opacity=0.25,
+):
+    """
+    Generate poor region map PNG using ONLY filtered_df.
+    No DB calls. No additional polygon filtering.
+    """
+    if value_col not in filtered_df.columns:
+        print(f" Missing column: {value_col}")
+        return
+
+    df = filtered_df[["lat", "lon", value_col]].copy()
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=["lat", "lon", value_col])
+
+    poor = df[df[value_col] < threshold]
+    print(f"{title} | Filtered Samples: {len(df)} | Poor Samples: {len(poor)}")
+
+    if poor.empty:
+        print(f" No poor samples for {value_col}")
+        return
+
+    candidates = _build_region_candidates(poor, grid_size)
+    regions = _select_non_overlapping_regions(candidates, min_distance_meters, top_regions)
+
+    if not regions:
+        print(f" No regions found for {value_col}")
+        return
+
+    fmap = folium.Map(
+        tiles="CartoDB positron",
+        zoom_control=True,
+        control_scale=False,
+        prefer_canvas=True
+    )
+
+    add_fullscreen_css(fmap)
+
+    for idx, region in enumerate(regions, start=1):
+        pts = region["points"]
+        center_lat = float(region["lat"])
+        center_lon = float(region["lon"])
+
+        distances = pts.apply(
+            lambda r: _haversine_m(center_lat, center_lon, r.lat, r.lon),
+            axis=1
+        )
+        radius = min(distances.max(), 350)
+
+        folium.Circle(
+            location=[center_lat, center_lon],
+            radius=radius,
+            color="red",
+            fill=True,
+            fill_opacity=region_opacity,
+            popup=f"{title} | Region {idx} | Samples: {len(pts)}"
+        ).add_to(fmap)
+
+        for _, p in pts.iterrows():
+            folium.CircleMarker(
+                location=[p.lat, p.lon],
+                radius=point_radius,
+                color="red",
+                fill=True,
+                fill_opacity=0.6
+            ).add_to(fmap)
+
+    add_legend(fmap, title, [("Poor Samples", "red", len(poor))])
+    
+    # Add polygon boundary on top for visibility
+    if polygon_wkt:
+        geom = loads(polygon_wkt)
+        # WKT format is (lon, lat), convert to (lat, lon) for folium
+        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
+
+        folium.Polygon(
+            locations=polygon_latlon,
+            color="#FF0000",  # Bright red
+            weight=5,
+            fill=False,
+            opacity=1.0,
+            tooltip="Polygon Boundary"
+        ).add_to(fmap)
+
+    bounds = get_df_bounds(df)
+    if polygon_wkt:
+        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
+
+    bounds = expand_bounds(bounds, expand_factor=0.02)
+
+    fmap.fit_bounds(
+        bounds,
+        padding_top_left=(20, 20),
+        padding_bottom_right=(320, 20),
+        max_zoom=18
+    )
+
+    fmap.save(tmp_html)
+
+    # Convert saved HTML to PNG using Playwright utility (consistent with other maps)
+    try:
+        from .playwright_utils import html_to_png
+        html_to_png(tmp_html, output_png)
+    except Exception as e:
+        print(f" Warning: failed to convert poor region html to png: {e}")
+    finally:
+        try:
+            if os.path.exists(tmp_html):
+                os.remove(tmp_html)
+        except Exception:
+            pass
+
+
+# =====================================================
+# BASE ROUTE MAP (DRIVE ROUTE + POLYGON) - PNG OUTPUT
+# =====================================================
+
+def generate_base_route_map(df, polygon_wkt, output_html):
+    """
+    Generate a basic map showing the drive route and polygon boundary.
+    No KPI overlays, just the route and boundary.
+    """
+    df = df.dropna(subset=["lat", "lon"])
+
+    if df.empty:
+        raise ValueError("No GPS data to plot for base route map")
+
+    m = folium.Map(
+        tiles="CartoDB positron",
+        zoom_control=True,
+        control_scale=False,
+        prefer_canvas=True
+    )
+
+    add_fullscreen_css(m)
+
+    # 1 Dense filled points for solid appearance (same style as KPI maps).
+    # No polyline so nothing appears outside the polygon.
+    for _, r in df.iterrows():
+        folium.CircleMarker(
+            location=(r["lat"], r["lon"]),
+            radius=4,
+            color="#2b8cbe",
+            fill=True,
+            fill_opacity=0.95,
+        ).add_to(m)
+
+    # 2 Polygon boundary (RED)
+    if polygon_wkt:
+        geom = loads(polygon_wkt)
+        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
+
+        folium.Polygon(
+            locations=polygon_latlon,
+            color="red",
+            weight=4,
+            fill=False,
+            opacity=1.0,
+            tooltip="Polygon Boundary"
+        ).add_to(m)
+
+    # Fit view to route + polygon
+    bounds = get_df_bounds(df)
+    if polygon_wkt:
+        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
+
+    bounds = expand_bounds(bounds, expand_factor=0.02)
+    m.fit_bounds(bounds, max_zoom=18)
+
+    m.save(output_html)
+
+
+def generate_poor_region_maps(filtered_df, output_dir="data/images/maps", tmp_dir="data/tmp", polygon_wkt=None):
+    """Generate RSRP/RSRQ poor region maps using only filtered_df."""
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    generate_poor_region_map(
+        filtered_df=filtered_df,
+        value_col="rsrp",
+        threshold=-105,
+        output_png=os.path.join(output_dir, "rsrp_poor_regions.png"),
+        tmp_html=os.path.join(tmp_dir, "rsrp_poor_regions.html"),
+        title="RSRP < -105",
+        polygon_wkt=polygon_wkt
+    )
+    # Also generate RSRQ poor region map
+    generate_poor_region_map(
+        filtered_df=filtered_df,
+        value_col="rsrq",
+        threshold=-14,
+        output_png=os.path.join(output_dir, "rsrq_poor_regions.png"),
+        tmp_html=os.path.join(tmp_dir, "rsrq_poor_regions.html"),
+        title="RSRQ < -14",
+        polygon_wkt=polygon_wkt
+    )
+
+
+def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
+    """
+    Generate HTML for handover visualization. `events` is a list of handover dicts
+    as returned by `detect_handover_events`.
+    """
+    df = filtered_df.dropna(subset=["lat", "lon"]) if filtered_df is not None else pd.DataFrame()
+    if df.empty:
+        raise ValueError("No GPS data to plot for handover map")
+
+    m = folium.Map(tiles="CartoDB positron", zoom_control=True, control_scale=False, prefer_canvas=True)
+    add_fullscreen_css(m)
+
+    # Draw dense route points only (no polylines).
+    # This prevents line-like rendering and keeps handover focus on events.
+    if "session_id" in df.columns:
+        sessions = sorted(df["session_id"].dropna().unique())
+        if "timestamp" in df.columns:
+            df_route = df.sort_values(["session_id", "timestamp"]).copy()
+        else:
+            df_route = df.sort_values(["session_id"]).copy()
+
+        colors = generate_distinct_colors(len(sessions)) if sessions else ["#2b8cbe"]
+
+        # Draw each session
+        for i, sid in enumerate(sessions):
+            seg = df_route[df_route["session_id"] == sid]
+            if seg.empty:
+                continue
+            # overlay filled points for solid appearance
+            for _, r in seg.iterrows():
+                folium.CircleMarker(location=(r["lat"], r["lon"]), radius=4, color=colors[i % len(colors)], fill=True, fill_opacity=0.95).add_to(m)
+
+        # Legend removed per user request - handover map should show only routes and handover events
+    else:
+        # Fallback: draw a single route backbone (pre-existing behavior)
+        if "timestamp" in df.columns:
+            df_route = df.sort_values(["timestamp"])
+        else:
+            df_route = df
+
+        # Overlay dense filled points (KPI-style) for solid track appearance
+        for _, r in df_route.iterrows():
+            folium.CircleMarker(location=(r["lat"], r["lon"]), radius=4, color="#2b8cbe", fill=True, fill_opacity=0.95).add_to(m)
+
+    # Add handover sparks
+    spark_svg = (
+        '<div style="transform: translate(-50%, -50%);">'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24">'
+        '<path fill="{color}" stroke="#222" stroke-width="0.6" d="M13 2 L3 14 H12 L11 22 L21 10 H12 L13 2 Z"/>'
+        '</svg></div>'
+    )
+    spark_color = "#ff9933"
+    for ev in events:
+        html = spark_svg.format(color=spark_color)
+        icon = folium.DivIcon(html=html, icon_size=(28, 28), icon_anchor=(14, 14))
+        tooltip = f"{ev.get('from_provider')} -> {ev.get('to_provider')} (Session {ev.get('session_id')})"
+        folium.Marker(location=(ev["lat"], ev["lon"]), icon=icon, tooltip=tooltip).add_to(m)
+
+    # Polygon boundary
+    if polygon_wkt:
+        geom = loads(polygon_wkt)
+        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
+        folium.Polygon(locations=polygon_latlon, color="#FF0000", weight=5, fill=False, opacity=1.0, tooltip="Polygon Boundary").add_to(m)
+
+    bounds = get_df_bounds(df)
+    if polygon_wkt:
+        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
+    bounds = expand_bounds(bounds, expand_factor=0.02)
+    m.fit_bounds(bounds, max_zoom=18)
+
+    m.save(output_html)
