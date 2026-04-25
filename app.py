@@ -13,6 +13,7 @@ from tools.area_breakup.routes import area_breakup_bp
 from tools.report.routes import report_bp
 from tools.lte_prediction.routes import lte_prediction_bp
 from tools.lte_prediction_optimised.routes import lte_prediction_op
+from tools.lte_tilt_recommandation.routes import rf_optimization_bp
 
 from extensions import db
 from flask_migrate import Migrate
@@ -79,7 +80,7 @@ def create_app(config_name='default'):
     app.register_blueprint(report_bp, url_prefix='/api/report')
     app.register_blueprint(lte_prediction_bp, url_prefix="/api/lte-prediction")
     app.register_blueprint(lte_prediction_op, url_prefix="/api/lte-prediction-optimised")
-
+    app.register_blueprint(rf_optimization_bp, url_prefix="/api/lte-tilt-recommandation")
     # ---------------- ROOT ----------------
     @app.route('/', methods=['GET'])
     def root():
@@ -92,7 +93,8 @@ def create_app(config_name='default'):
                 "area_breakup": "/api/area-breakup",
                 "report": "/api/report",
                 "site_prediction": "/api/lte-prediction/run",
-                "optimized_prediction": "/api/lte-prediction-optimised/run"
+                "optimized_prediction": "/api/lte-prediction-optimised/run",
+                "rf_optimization": "/api/lte-tilt-recommandation/optimize"
             }
         })
 
