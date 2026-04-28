@@ -16,14 +16,27 @@ from .Sector_wise_prediction_code_copy import run_prediction_from_api
 # ==========================================================
 
 load_dotenv()
-engine = create_engine(os.getenv("DATABASE_URL"))
+
+engine = {
+    "india": create_engine(
+        os.getenv("DATABASE_URL"),
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+    ) if os.getenv("DATABASE_URL") else None,
+    
+    "taiwan": create_engine(
+        os.getenv("DATABASE_URL_Taiwan"), 
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+    ) if os.getenv("DATABASE_URL_Taiwan") else None
+}
 
 
 # ==========================================================
 # FETCH BASELINE (AS DRIVE TEST)
 # ==========================================================
 
-def fetch_baseline(project_id):
+def fetch_baseline(project_id, region="india"):
+
+    current_engine = engine.get(region.lower(), engine["india"])
 
     query = f"""
     SELECT lat, lon, pred_rsrp as rsrp, cell_id
@@ -31,7 +44,7 @@ def fetch_baseline(project_id):
     WHERE project_id = {project_id}
     """
 
-    df = pd.read_sql(query, engine)
+    df = pd.read_sql(query, current_engine)
 
     df["Node_Cell_ID"] = df["cell_id"].astype(str)
 
@@ -42,15 +55,15 @@ def fetch_baseline(project_id):
 # FETCH ORIGINAL SITE DATA
 # ==========================================================
 
-def fetch_site_data(project_id):
-
+def fetch_site_data(project_id,region="india"):
+    current_engine = engine.get(region.lower(), engine["india"])
     query = f"""
     SELECT *
     FROM site_prediction
     WHERE tbl_project_id = {project_id}
     """
 
-    df = pd.read_sql(query, engine)
+    df = pd.read_sql(query, current_engine)
 
     # 🔥 MATCH YOUR SCRIPT FORMAT
     df = df.rename(columns={
@@ -78,7 +91,8 @@ def fetch_site_data(project_id):
 # FETCH OPTIMIZED SITE DATA (OPERATOR-WISE)
 # ==========================================================
 
-def fetch_optimized_sites(project_id, operator):
+def fetch_optimized_sites(project_id, operator,region="india"):
+    current_engine = engine.get(region.lower(), engine["india"])
 
     # 🔥 Much simpler query! No JOIN needed since the operator is right here.
     query = f"""
@@ -88,7 +102,7 @@ def fetch_optimized_sites(project_id, operator):
     AND cluster_name = '{operator}'
     """
 
-    df = pd.read_sql(query, engine)
+    df = pd.read_sql(query, current_engine)
 
     df = df.rename(columns={
         "latitude": "lat",

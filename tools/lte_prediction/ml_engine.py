@@ -11,30 +11,27 @@ from dotenv import load_dotenv
 # 🔥 Load .env
 load_dotenv()
 
-# 🔥 Get DB URL
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise ValueError("❌ DATABASE_URL not found in .env")
-
-# 🔥 Create engine
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True
-)
-
+engine = {
+    "india": create_engine(
+        os.getenv("DATABASE_URL"),
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+    ) if os.getenv("DATABASE_URL") else None,
+    
+    "taiwan": create_engine(
+        os.getenv("DATABASE_URL_Taiwan"), 
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+    ) if os.getenv("DATABASE_URL_Taiwan") else None
+}
 # 🔹 TEMP DB MOCK (replace later)
-def fetch_site_data(project_id):
-
+def fetch_site_data(project_id , region="india"):
+    current_engine = engine.get(region.lower(), engine["india"])
     query = f"""
     SELECT *
     FROM site_prediction
     WHERE tbl_project_id = {project_id}
     """
 
-    df = pd.read_sql(query, engine)
+    df = pd.read_sql(query, current_engine)
 
     if df.empty:
         raise ValueError("❌ No site data found")
@@ -104,7 +101,7 @@ def fetch_site_data(project_id):
     return df
 
 
-def fetch_drive_data(session_ids, operator):
+def fetch_drive_data(session_ids, operator,region="india"):
 
     import os
 
@@ -115,6 +112,8 @@ def fetch_drive_data(session_ids, operator):
     if os.path.exists(path):
         print("⚡ CACHE HIT")
         return pd.read_parquet(path)
+    
+    current_engine = engine.get(region.lower(), engine["india"])
 
     query = f"""
     SELECT lat, lon, rsrp, rsrq, sinr
@@ -130,14 +129,16 @@ def fetch_drive_data(session_ids, operator):
     AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
     """
 
-    df = pd.read_sql(query, engine)
+    df = pd.read_sql(query, current_engine)
 
     df.to_parquet(path)
 
     return df
 
 
-def fetch_building_data(project_id):
+def fetch_building_data(project_id, region="india"):
+
+    current_engine = engine.get(region.lower(), engine["india"])
 
     query = f"""
     SELECT *
@@ -145,7 +146,7 @@ def fetch_building_data(project_id):
     WHERE project_id = {project_id}
     """
 
-    return pd.read_sql(query, engine)
+    return pd.read_sql(query, current_engine)
 
 
 def fetch_polygon_data(project_id):

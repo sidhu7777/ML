@@ -9,15 +9,23 @@ from sqlalchemy import create_engine, text
 # Global dictionary to track job status
 JOBS = {}
 
-# 1. ENGINE FIX: Aggressive Connection Recycling
-# This prevents SQLAlchemy from using "dead" connections
-engine = create_engine(
-    os.getenv("DATABASE_URL"),
-    pool_size=10,
-    max_overflow=20,
-    pool_recycle=300,        # Drops connections older than 5 minutes
-    pool_pre_ping=True       # Pings the DB to check if it's alive before querying
-)
+# ==========================================================
+# MULTI-REGION DATABASE ENGINES
+# Aggressive Connection Recycling prevents SQLAlchemy from using "dead" connections
+# ==========================================================
+engine = {
+    # India Database (uses your original DATABASE_URL)
+    "india": create_engine(
+        os.getenv("DATABASE_URL"),
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+    ) if os.getenv("DATABASE_URL") else None,
+    
+    # Taiwan Database (Matches your exact .env variable name)
+    "taiwan": create_engine(
+        os.getenv("DATABASE_URL_Taiwan"), 
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+    ) if os.getenv("DATABASE_URL_Taiwan") else None
+}
 
 class RFOptimizationService:
 
@@ -30,18 +38,29 @@ class RFOptimizationService:
     def get(self, job_id):
         return JOBS.get(job_id)
 
-    def _get_next_scenario_id(self, project_id):
+    def _get_next_scenario_id(self, project_id, current_engine):
+        """Finds the next scenario number for a given project using the correct regional DB."""
         query = text("SELECT COALESCE(MAX(scenario_id), 0) + 1 FROM rf_optimization_results WHERE project_id = :pid")
         try:
-            with engine.connect() as conn:
+            with current_engine.connect() as conn:
                 result = conn.execute(query, {"pid": project_id}).scalar()
                 return int(result) if result else 1
-        except Exception:
+        except Exception as e:
+            print(f"Error fetching scenario ID: {e}")
             return 1
 
     def _run(self, job_id, cfg):
         try:
-            self._update(job_id, "running", "Fetching antenna records...")
+            # ==========================================
+            # 1. REGION & ENGINE SELECTION
+            # ==========================================
+            region = str(cfg.get("region", "india")).lower()
+            current_engine = engine.get(region)
+            
+            if current_engine is None:
+                raise ValueError(f"Database config for region '{region}' not found or .env variable is missing.")
+
+            self._update(job_id, "running", f"Initializing {region.upper()} optimization job...")
             project_id = cfg["project_id"]
             
             operator_input = cfg.get("operator")
@@ -52,18 +71,19 @@ class RFOptimizationService:
             s_thresh = str(cfg.get("sinr", 0))
 
             # ==========================================
-            # STEP 1: Fetch Small Table First (Prevents Timeout)
+            # 2. FETCH ANTENNA DATA FIRST (Prevents Timeout)
             # ==========================================
+            self._update(job_id, "running", "Fetching antenna records...")
             ant_query = text("SELECT * FROM site_prediction WHERE tbl_project_id = :pid")
-            with engine.connect() as conn:
+            with current_engine.connect() as conn:
                 antenna_df = pd.read_sql(ant_query, conn, params={"pid": project_id})
 
             # ==========================================
-            # STEP 2: Fetch Massive Table in Chunks
+            # 3. FETCH LARGE LOG DATA IN CHUNKS
             # ==========================================
-            self._update(job_id, "running", "Fetching a data")
+            self._update(job_id, "running", "Downloading large log data in chunks...")
             
-            # Select only needed columns to speed up the network transfer without DB changes
+            # Select only needed columns to speed up the network transfer without DB indexing
             log_cols = "node_b_id, cell_id, operator, pred_rsrp, pred_rsrq, pred_sinr, lat, lon"
             
             if not is_all_operators:
@@ -74,20 +94,18 @@ class RFOptimizationService:
                 log_params = {"pid": project_id}
 
             log_dfs = []
-            with engine.connect() as conn:
-                # Reading in chunks keeps the connection active and prevents memory crashes
+            with current_engine.connect() as conn:
                 for chunk in pd.read_sql(log_query, conn, params=log_params, chunksize=50000):
                     log_dfs.append(chunk)
 
             if not log_dfs:
                 raise ValueError(f"No log data found for project {project_id}")
             
-            # Combine all chunks into one DataFrame
             log_df = pd.concat(log_dfs, ignore_index=True)
             del log_dfs # Free up memory
 
             # ==========================================
-            # STEP 3: Robust Operator Mapping
+            # 4. ROBUST OPERATOR MAPPING
             # ==========================================
             self._update(job_id, "running", "Processing optimization script...")
 
@@ -101,7 +119,9 @@ class RFOptimizationService:
             )
             operator_map = log_df.drop_duplicates("clean_key").set_index("clean_key")["operator"].to_dict()
 
-            # Prepare Paths
+            # ==========================================
+            # 5. PREPARE PATHS & TRIGGER SCRIPT
+            # ==========================================
             current_dir = os.path.dirname(os.path.abspath(__file__))
             root_dir = os.path.normpath(os.path.join(current_dir, "..", ".."))
             temp_dir = os.path.normpath(os.path.join(root_dir, "outputs", f"temp_{job_id}"))
@@ -119,8 +139,7 @@ class RFOptimizationService:
             log_df_script.to_csv(log_csv, index=False, chunksize=50000)
             antenna_df.to_csv(ant_csv, index=False)
 
-            # Trigger Script
-            scenario_id = self._get_next_scenario_id(project_id)
+            scenario_id = self._get_next_scenario_id(project_id, current_engine)
             script_path = os.path.normpath(os.path.join(current_dir, "etilt_optimizer_cd2.py"))
             
             process = subprocess.run(
@@ -132,13 +151,14 @@ class RFOptimizationService:
                 raise Exception(f"Script Error: {process.stderr}")
 
             # ==========================================
-            # STEP 4: Save Results mapping Operator
+            # 6. SAVE RESULTS MAPPING CORRECT OPERATOR
             # ==========================================
             self._update(job_id, "running", "Saving recommendations to database...")
             
             output_file = os.path.join(temp_dir, "RF_Optimization_Report.xlsx")
             reco_df = pd.read_excel(output_file, sheet_name="Recommendations")
             
+            # Ensure "ALL" is replaced by the actual cell's operator
             reco_df["final_operator"] = reco_df["Cell ID"].astype(str).map(operator_map).fillna(
                 operator_input if (operator_input and not is_all_operators) else "Unknown"
             )
@@ -160,8 +180,8 @@ class RFOptimizationService:
                 "created_at": datetime.datetime.now()
             })
 
-            # Fast DB saving
-            with engine.begin() as conn:
+            # Fast DB saving with chunks using the correct regional engine
+            with current_engine.begin() as conn:
                 db_save_df.to_sql("rf_optimization_results", conn, if_exists="append", index=False, method="multi", chunksize=1000)
 
             JOBS[job_id].update({"status": "done", "output": output_file, "scenario": scenario_id})

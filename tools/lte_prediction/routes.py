@@ -16,6 +16,7 @@ def run_prediction():
         cfg = {
             "project_id": int(data["project_id"]),
             "session_ids": data["session_ids"],
+            "region": str(data.get("region", "india")).lower(),
             "radius_m": float(data.get("radius", 500)),
             "grid_resolution": float(data.get("grid_resolution", 25)),
             "building": bool(data.get("building", True)),

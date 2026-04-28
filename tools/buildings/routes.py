@@ -65,7 +65,6 @@ def handle_preflight():
 # -------------------------------------
 @buildings_bp.route("/generate", methods=["POST"])
 def generate_buildings():
-
     try:
         if not request.is_json:
             return jsonify({"Status": 0, "Message": "JSON body required"}), 400
@@ -74,6 +73,9 @@ def generate_buildings():
         raw_wkt = data.get("WKT") or data.get("wkt")
         name = data.get("Name")
         project_id = data.get("project_id")
+        
+        # ✅ EXTRACT REGION (Defaults to india)
+        region = str(data.get("region", "india")).lower()
 
         if not raw_wkt or not name or not project_id:
              return jsonify({"Status": 0, "Message": "WKT, Name, and project_id are required"}), 400
@@ -84,8 +86,8 @@ def generate_buildings():
         except Exception as e:
              return jsonify({"Status": 0, "Message": f"Invalid WKT: {str(e)}"}), 400
 
-        # Pass the processed polygon and the swap flag to the service
-        result = service.process_buildings(polygon, name, project_id, swap_output=was_swapped)
+        # ✅ Pass region to the service
+        result = service.process_buildings(polygon, name, project_id, swap_output=was_swapped, region=region)
 
         if not result:
             return jsonify({
@@ -123,7 +125,8 @@ def test():
     wkt_str = "POLYGON((77.2090 28.6139, 77.2100 28.6139, 77.2100 28.6149, 77.2090 28.6149, 77.2090 28.6139))"
     poly = wkt.loads(wkt_str)
     
-    geojson, count, saved = service.process_buildings(poly, "Test Area", 999, swap_output=False)
+    # Defaults to India for tests
+    geojson, count, saved = service.process_buildings(poly, "Test Area", 999, swap_output=False, region="india")
 
     return jsonify({
         "Status": 1,

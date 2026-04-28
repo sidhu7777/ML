@@ -20,7 +20,18 @@ from .ml_engine import (
 JOBS = {}
 
 # Database connection
-engine = create_engine(os.getenv("DATABASE_URL"))
+engine = {
+    "india": create_engine(
+        os.getenv("DATABASE_URL"),
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+    ) if os.getenv("DATABASE_URL") else None,
+    
+    "taiwan": create_engine(
+        os.getenv("DATABASE_URL_Taiwan"), 
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+    ) if os.getenv("DATABASE_URL_Taiwan") else None
+}
+
 
 class LTEPredictionService_optimised:
 
@@ -45,21 +56,21 @@ class LTEPredictionService_optimised:
 
             project_id = cfg["project_id"]
             
-            # ✅ Extract the operator sent from the frontend (Defaults to Airtel if missing)
+            # ✅ Extract region and operator from the frontend
+            region = str(cfg.get("region", "india")).lower()
             operator = cfg.get("operator", "Airtel")
 
-            baseline_df = fetch_baseline(project_id)
+            # ✅ Pass the region into your fetch functions!
+            baseline_df = fetch_baseline(project_id, region=region)
 
             self._update(job_id, "running", "Loading site data")
-            site_df = fetch_site_data(project_id)
+            site_df = fetch_site_data(project_id, region=region)
 
             self._update(job_id, "running", "Calculating K1/K2")
             k1k2_map = compute_k1k2(baseline_df, site_df)
 
             self._update(job_id, "running", f"Loading optimized sites for {operator}")
-            
-            # ✅ Pass the operator to fetch only that specific operator's sites
-            opt_sites = fetch_optimized_sites(project_id, operator)
+            opt_sites = fetch_optimized_sites(project_id, operator, region=region)
 
             params = {
                 "radius": cfg.get("radius", 500),
@@ -84,11 +95,11 @@ class LTEPredictionService_optimised:
             # Save the CSV
             file_path = self._save_csv(optimized_df, project_id, operator)
 
-            # ✅ Format for DB (Passing the operator down)
+            # Format for DB 
             db_df = self._format_for_db(optimized_df, project_id, job_id, operator)
 
-            # Save to DB
-            self._save_to_db(db_df)
+            # ✅ Save to DB (Passing the region down!)
+            self._save_to_db(db_df, region=region)
 
             JOBS[job_id]["output"] = file_path
             JOBS[job_id]["rows"] = len(optimized_df)
@@ -116,10 +127,13 @@ class LTEPredictionService_optimised:
 
         return file_path
     
-    def _save_to_db(self, df):
+    def _save_to_db(self, df, region="india"):
+        # ✅ FIXED: Removed 'self.' because engine is a global dictionary
+        current_engine = engine.get(region.lower(), engine["india"])
+        
         df.to_sql(
             "lte_prediction_optimised_results",
-            con=engine,
+            con=current_engine,
             if_exists="append",
             index=False,
             chunksize=15000,
@@ -127,7 +141,6 @@ class LTEPredictionService_optimised:
         )
         print("✅ Data saved to DB")
     
-    # ✅ Includes 'operator' parameter
     def _format_for_db(self, df, project_id, job_id, operator):
         import datetime
 
@@ -146,11 +159,10 @@ class LTEPredictionService_optimised:
         df["job_id"] = job_id
         
         df["Technology"] = "4G"
-        df["Operator"] = operator  # ✅ Assign the dynamic operator value
+        df["Operator"] = operator  
         df["created_at"] = datetime.datetime.now()
         df["site_id"] = df["node_b_id"]
 
-        # ✅ Final column ordering (Operator moved to the very end as requested)
         final_df = df[[
             "project_id",
             "job_id",

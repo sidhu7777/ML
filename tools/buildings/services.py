@@ -8,27 +8,34 @@ from shapely import ops
 import sqlalchemy as db
 from sqlalchemy.exc import OperationalError
 from flask import current_app
+from dotenv import load_dotenv
 
 # -------------------------------------
-# GLOBAL ENGINE
+# GLOBAL ENGINE (MULTI-REGION)
 # -------------------------------------
-DB_URI = os.getenv("DATABASE_URL")
+load_dotenv()
 
-if not DB_URI:
-    raise RuntimeError("DATABASE_URL not configured in environment variables")
+engine_dict = {
+    "india": db.create_engine(
+        os.getenv("DATABASE_URL"),
+        pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=3600
+    ) if os.getenv("DATABASE_URL") else None,
+    
+    "taiwan": db.create_engine(
+        os.getenv("DATABASE_URL_Taiwan"),
+        pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=3600
+    ) if os.getenv("DATABASE_URL_Taiwan") else None
+}
 
-try:
-    # Removed SSL/ca.pem constraints
-    engine = db.create_engine(
-        DB_URI,
-        pool_size=10,
-        max_overflow=20,
-        pool_pre_ping=True,
-        pool_recycle=3600
-    )
-except Exception as e:
-    logging.error(f"Database connection failed: {e}")
-    engine = None
+def get_regional_engine(region_name):
+    """Safely retrieves the requested region engine, falling back to India."""
+    region = str(region_name).lower()
+    current_engine = engine_dict.get(region, engine_dict.get("india"))
+    
+    if current_engine is None:
+        raise RuntimeError(f"Database engine for region '{region}' is not initialized/configured.")
+        
+    return current_engine
 
 
 # -------------------------------------
@@ -38,7 +45,6 @@ class BuildingService:
 
     def fetch_buildings(self, polygon):
         """Fetch buildings from OSM"""
-
         if not polygon.is_valid:
             polygon = polygon.buffer(0)
 
@@ -64,22 +70,21 @@ class BuildingService:
             raise e
 
     # -------------------------------------
-    # SAVE TO DATABASE (UPDATED WITH SWAP LOGIC)
+    # SAVE TO DATABASE
     # -------------------------------------
-    def save_buildings_to_db(self, buildings, area_name, project_id, swap_output=False):
-
-        if engine is None:
-            raise RuntimeError("Database engine is not initialized")
+    # ✅ Added 'region' parameter
+    def save_buildings_to_db(self, buildings, area_name, project_id, swap_output=False, region="india"):
+        
+        # ✅ Fetch regional engine dynamically
+        current_engine = get_regional_engine(region)
 
         # EXPLODE MULTIPOLYGONS
         buildings_exp = buildings.explode(index_parts=True, ignore_index=True)
         
         # --- FIX: Calculate Area FIRST ---
-        # Calculate area while coordinates are still in standard Lon/Lat format.
-        # This prevents the CRS projection from failing and creating NaNs.
         buildings_exp["calc_area"] = buildings_exp.to_crs(epsg=3857).geometry.area
         
-        # Safety net: Convert any mathematically impossible areas to 0 so MySQL doesn't crash
+        # Safety net: Convert any mathematically impossible areas to 0
         buildings_exp["calc_area"] = buildings_exp["calc_area"].fillna(0)
 
         # --- SWAP BACK LOGIC (Lon/Lat -> Lat/Lon) ---
@@ -98,7 +103,8 @@ class BuildingService:
             for row in buildings_exp.itertuples()
         ]
 
-        raw = engine.raw_connection()
+        # ✅ Grab the raw connection specifically from the regional engine
+        raw = current_engine.raw_connection()
         cur = raw.cursor()
 
         try:
@@ -137,20 +143,19 @@ class BuildingService:
     # -------------------------------------
     # MAIN EXTRACT + SAVE METHOD (UPDATED)
     # -------------------------------------
-    def process_buildings(self, polygon, name, project_id, swap_output=False):
+    # ✅ Added 'region' parameter
+    def process_buildings(self, polygon, name, project_id, swap_output=False, region="india"):
         """
         Extract buildings and save them to DB
         """
-        # Note: 'polygon' is now passed in as a shapely object, not raw data
         buildings, count = self.fetch_buildings(polygon)
 
         if buildings is None or buildings.empty:
             return None, 0, 0
 
-        # Pass the swap flag to the save function
-        saved_count = self.save_buildings_to_db(buildings, name, project_id, swap_output=swap_output)
+        # ✅ Pass region down to the save function
+        saved_count = self.save_buildings_to_db(buildings, name, project_id, swap_output=swap_output, region=region)
 
         geojson = json.loads(buildings.to_json())
 
         return geojson, count, saved_count
-    
