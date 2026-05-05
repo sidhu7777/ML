@@ -1,0 +1,106 @@
+#Run the backend and keep this terminal open to watch logs.
+
+cd c:\ml\python-ml-backend_23042026
+$env:FLASK_ENV="development"
+$env:LOG_LEVEL="INFO"
+venv\Scripts\python.exe app.py
+
+
+
+#Run this first, because optimized and tilt both depend on baseline output.
+
+cd c:\ml\python-ml-backend_23042026
+
+$body = @{
+  project_id = 196
+  session_ids = @(4187,4178,4180)
+  region = "india"
+  radius = 500
+  grid_resolution = 25
+  n_workers = 8
+} | ConvertTo-Json
+
+$job = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8080/api/lte-prediction/run" `
+  -ContentType "application/json" `
+  -Body $body
+
+$job
+
+
+#Poll status:
+
+Invoke-RestMethod "http://127.0.0.1:8080/api/lte-prediction/status/$($job.job_id)"
+
+
+#Live poll loop:
+
+do {
+  $s = Invoke-RestMethod "http://127.0.0.1:8080/api/lte-prediction/status/$($job.job_id)"
+  $s
+  Start-Sleep -Seconds 5
+} while ($s.status -ne "done" -and $s.status -ne "failed")
+
+
+
+#Terminal 2: Optimized LTE prediction,Run this only after baseline is done.
+
+$body = @{
+  project_id = 196
+  operator = "Airtel"
+  region = "india"
+  radius = 500
+  grid_resolution = 10
+  n_workers = 8
+} | ConvertTo-Json
+
+$job = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8080/api/lte-prediction-optimised/optimized" `
+  -ContentType "application/json" `
+  -Body $body
+
+$job
+
+
+
+# Poll status:
+
+do {
+  $s = Invoke-RestMethod "http://127.0.0.1:8080/api/lte-prediction-optimised/status/$($job.job_id)"
+  $s
+  Start-Sleep -Seconds 5
+} while ($s.status -ne "done" -and $s.status -ne "failed")
+
+
+Terminal 2: Tilt optimization,This also uses baseline results, so run it after baseline.
+
+$body = @{
+  project_id = 196
+  operator = "Airtel"
+  region = "india"
+  rsrp = -105
+  rsrq = -15
+  sinr = 0
+} | ConvertTo-Json
+
+$job = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8080/api/lte-tilt-recommandation/optimize" `
+  -ContentType "application/json" `
+  -Body $body
+
+$job
+
+#Poll status:
+
+do {
+  $s = Invoke-RestMethod "http://127.0.0.1:8080/api/lte-tilt-recommandation/status/$($job.job_id)"
+  $s
+  Start-Sleep -Seconds 5
+} while ($s.status -ne "done" -and $s.status -ne "failed")
+
+
+
+

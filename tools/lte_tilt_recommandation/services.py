@@ -9,6 +9,30 @@ from sqlalchemy import create_engine, text
 # Global dictionary to track job status
 JOBS = {}
 
+
+def _safe_nunique(df, col):
+    return int(df[col].nunique(dropna=True)) if col in df.columns else "n/a"
+
+
+def _safe_minmax(df, col):
+    if col not in df.columns:
+        return "n/a"
+    series = pd.to_numeric(df[col], errors="coerce").dropna()
+    if series.empty:
+        return "n/a"
+    return f"{series.min():.4f}..{series.max():.4f}"
+
+
+def _log_df(stage, df):
+    print(f"[TILT][{stage}] shape={df.shape}")
+    print(f"[TILT][{stage}] columns={list(df.columns)}")
+    for col in ["cell_id", "nodeb_id", "node_b_id", "operator", "final_operator", "Technology"]:
+        if col in df.columns:
+            print(f"[TILT][{stage}] distinct_{col}={_safe_nunique(df, col)}")
+    for col in ["rsrp", "rsrq", "sinr", "pred_rsrp", "pred_rsrq", "pred_sinr"]:
+        if col in df.columns:
+            print(f"[TILT][{stage}] range_{col}={_safe_minmax(df, col)}")
+
 # ==========================================================
 # MULTI-REGION DATABASE ENGINES
 # Aggressive Connection Recycling prevents SQLAlchemy from using "dead" connections
@@ -62,6 +86,11 @@ class RFOptimizationService:
 
             self._update(job_id, "running", f"Initializing {region.upper()} optimization job...")
             project_id = cfg["project_id"]
+            print(
+                f"[TILT][JOB_START] job_id={job_id} project_id={project_id} region={region} "
+                f"operator={cfg.get('operator')} rsrp={cfg.get('rsrp', -105)} "
+                f"rsrq={cfg.get('rsrq', -15)} sinr={cfg.get('sinr', 0)}"
+            )
             
             operator_input = cfg.get("operator")
             is_all_operators = not operator_input or str(operator_input).lower() in ["all", "none", ""]
@@ -77,6 +106,7 @@ class RFOptimizationService:
             ant_query = text("SELECT * FROM site_prediction WHERE tbl_project_id = :pid")
             with current_engine.connect() as conn:
                 antenna_df = pd.read_sql(ant_query, conn, params={"pid": project_id})
+            _log_df("ANTENNA_FETCH", antenna_df)
 
             # ==========================================
             # 3. FETCH LARGE LOG DATA IN CHUNKS
@@ -96,6 +126,7 @@ class RFOptimizationService:
             log_dfs = []
             with current_engine.connect() as conn:
                 for chunk in pd.read_sql(log_query, conn, params=log_params, chunksize=50000):
+                    print(f"[TILT][BASELINE_FETCH] chunk_rows={len(chunk)}")
                     log_dfs.append(chunk)
 
             if not log_dfs:
@@ -103,6 +134,7 @@ class RFOptimizationService:
             
             log_df = pd.concat(log_dfs, ignore_index=True)
             del log_dfs # Free up memory
+            _log_df("BASELINE_FETCH_COMBINED", log_df)
 
             # ==========================================
             # 4. ROBUST OPERATOR MAPPING
@@ -118,6 +150,7 @@ class RFOptimizationService:
                 log_df["cell_id"].apply(clean_id)
             )
             operator_map = log_df.drop_duplicates("clean_key").set_index("clean_key")["operator"].to_dict()
+            print(f"[TILT][OPERATOR_MAP] mapped_keys={len(operator_map)}")
 
             # ==========================================
             # 5. PREPARE PATHS & TRIGGER SCRIPT
@@ -146,6 +179,10 @@ class RFOptimizationService:
                 ["python", script_path, log_csv, ant_csv, r_thresh, q_thresh, s_thresh],
                 capture_output=True, text=True
             )
+            if process.stdout:
+                print("[TILT][SCRIPT_STDOUT_BEGIN]")
+                print(process.stdout)
+                print("[TILT][SCRIPT_STDOUT_END]")
 
             if process.returncode != 0:
                 raise Exception(f"Script Error: {process.stderr}")
@@ -157,6 +194,7 @@ class RFOptimizationService:
             
             output_file = os.path.join(temp_dir, "RF_Optimization_Report.xlsx")
             reco_df = pd.read_excel(output_file, sheet_name="Recommendations")
+            _log_df("RECOMMENDATIONS_FETCH", reco_df)
             
             # Ensure "ALL" is replaced by the actual cell's operator
             reco_df["final_operator"] = reco_df["Cell ID"].astype(str).map(operator_map).fillna(
@@ -179,6 +217,11 @@ class RFOptimizationService:
                 "sinr_threshold": float(s_thresh),
                 "created_at": datetime.datetime.now()
             })
+            _log_df("DB_PAYLOAD", db_save_df)
+            print(
+                f"[TILT][DB_WRITE] table=rf_optimization_results mode=append "
+                f"rows={len(db_save_df)} project_id={project_id} scenario_id={scenario_id}"
+            )
 
             # Fast DB saving with chunks using the correct regional engine
             with current_engine.begin() as conn:

@@ -1,32 +1,33 @@
-# Byte-compiled / optimized / DLL files
+# Python bytecode / extension modules
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 
-# Virtual environments
+# Virtual environments / Python tooling
 .Python
+.venv/
 venv/
 env/
 ENV/
-.venv/
+.python-version
 
-# Environment / secrets
+# Environment / local secrets
 .env
 .env.*
 !.env.example
 
-# Flask
+# Flask / app-local state
 instance/
 .webassets-cache
 
-# Tool caches
+# Test / lint / notebook caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
 
-# IDE / OS
+# IDE / OS files
 .vscode/
 .idea/
 *.swp
@@ -34,26 +35,15 @@ instance/
 .DS_Store
 Thumbs.db
 
-# Logs and temp
+# Logs / temp files
 logs/
 *.log
 tmp/
 temp/
+temp_rf/
 *.tmp
 
-# Project generated content
-uploads/
-outputs/
-cache/
-data/reports/
-
-# Optional local data files
-*.csv
-*.xlsx
-*.xls
-*.geojson
-
-# Build / coverage
+# Build / packaging / coverage
 build/
 dist/
 *.egg-info/
@@ -61,14 +51,19 @@ dist/
 coverage.xml
 htmlcov/
 
-# Render
-.render/
-Pdf_Report_Generator/
-
-
+# Generated project outputs
+cache/
+uploads/
+outputs/
+data/
 data/reports/
 
-data/
+# Local reports / exports / archives
+*.csv
+*.xlsx
+*.xls
+*.geojson
+*.zip
 
-
-cache/
+# Platform / deployment-local
+.render/

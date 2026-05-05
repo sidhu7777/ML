@@ -351,6 +351,10 @@ def calibrate_site(drive_df, site_rows, tx, gain, closs, freq):
     dt["RSRP_meas"] = pd.to_numeric(dt[rcol], errors="coerce")
     dt = dt.dropna(subset=["RSRP_meas"])
     dt = dt[(dt["RSRP_meas"] >= -150) & (dt["RSRP_meas"] <= -30)]
+    print(
+        f"[LTE][CALIBRATION] serving_rows={len(site_rows)} valid_dt_rows={len(dt)} "
+        f"tx={tx} gain={gain} cable_loss={closs} freq_mhz={freq}"
+    )
 
     if len(dt) < 10:
         return 0, 0   # ← FIX: was (169, 35.2)
@@ -383,6 +387,10 @@ def calibrate_site(drive_df, site_rows, tx, gain, closs, freq):
 
     K1 = float(np.clip(K1, 120, 170))
     K2 = float(np.clip(K2, 20, 60))
+    print(
+        f"[LTE][CALIBRATION] calibrated_k1={K1:.4f} calibrated_k2={K2:.4f} "
+        f"distance_km_range={dkm.min():.4f}..{dkm.max():.4f} spread_km={spread_km:.4f}"
+    )
     return K1, K2
 
 # ==========================================================
@@ -392,6 +400,10 @@ def calibrate_site(drive_df, site_rows, tx, gain, closs, freq):
 def generate_grid(site_rows, radius_m=5000, res=25):
     clat = site_rows["lat"].mean()
     clon = site_rows["lon"].mean()
+    print(
+        f"[LTE][GRID] center_lat={clat:.6f} center_lon={clon:.6f} "
+        f"radius_m={radius_m} resolution_m={res} serving_rows={len(site_rows)}"
+    )
 
     lat_step = res / 111320
     lon_step = res / (111320 * math.cos(math.radians(clat)))
@@ -414,6 +426,11 @@ def generate_grid(site_rows, radius_m=5000, res=25):
     mask = d <= radius_m
 
     df = pd.DataFrame({"lat": latf[mask], "lon": lonf[mask]})
+    print(
+        f"[LTE][GRID] generated_points={len(df)} "
+        f"lat_range={df['lat'].min():.6f}..{df['lat'].max():.6f} "
+        f"lon_range={df['lon'].min():.6f}..{df['lon'].max():.6f}"
+    )
     return df
 
 # ==========================================================
@@ -427,10 +444,17 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
 
     print(f"🚀 Using {n_workers} CPU cores for {len(test_pts)} points")
 
+    print(
+        f"[LTE][PATHLOSS] serving_rows={len(serving_site_rows)} "
+        f"interference_site_rows={len(params.get('all_sites_rows', serving_site_rows))} "
+        f"freq_mhz={params.get('frequency_mhz')} bandwidth_mhz={params.get('bandwidth_mhz')} "
+        f"k1={params.get('k1')} k2={params.get('k2')}"
+    )
     total_points = len(test_pts)
 
     # 🔥 SMART CHUNKING
     chunk_size = max(1000, total_points // (n_workers * 2))
+    print(f"[LTE][PATHLOSS] total_points={total_points} chunk_size={chunk_size}")
 
     chunks = []
     for i in range(0, total_points, chunk_size):
@@ -488,11 +512,16 @@ def generate_accuracy_report(drive_df, site_df, params):
     dt["RSRP_pred"] = rsrp_pred
     dt["RSRQ_pred"] = rsrq_pred
     dt["SINR_pred"] = sinr_pred
+    print(
+        f"[LTE][RF_ACCURACY] site_rows={len(site_df)} dt_rows={len(dt)} "
+        f"pred_rsrp_range={dt['RSRP_pred'].min():.4f}..{dt['RSRP_pred'].max():.4f}"
+    )
 
     # RSRP
     print(f"\n✅ RSRP ACCURACY:")
     print(f"   MAE  : {mean_absolute_error(dt['RSRP_meas'], dt['RSRP_pred']):.2f} dB")
     print(f"   RMSE : {np.sqrt(mean_squared_error(dt['RSRP_meas'], dt['RSRP_pred'])):.2f} dB")
+    print(f"   R2   : {r2_score(dt['RSRP_meas'], dt['RSRP_pred']):.4f}")
 
     # RSRQ
     if qcol:
@@ -502,6 +531,7 @@ def generate_accuracy_report(drive_df, site_df, params):
             print(f"\n✅ RSRQ ACCURACY:")
             print(f"   MAE  : {mean_absolute_error(vq['RSRQ_meas'], vq['RSRQ_pred']):.2f} dB")
             print(f"   RMSE : {np.sqrt(mean_squared_error(vq['RSRQ_meas'], vq['RSRQ_pred'])):.2f} dB")
+            print(f"   R2   : {r2_score(vq['RSRQ_meas'], vq['RSRQ_pred']):.4f}")
     else:
         print("\n⚠ No RSRQ column found in DT file.")
 
@@ -513,6 +543,7 @@ def generate_accuracy_report(drive_df, site_df, params):
             print(f"\n✅ SINR ACCURACY:")
             print(f"   MAE  : {mean_absolute_error(vs['SINR_meas'], vs['SINR_pred']):.2f} dB")
             print(f"   RMSE : {np.sqrt(mean_squared_error(vs['SINR_meas'], vs['SINR_pred'])):.2f} dB")
+            print(f"   R2   : {r2_score(vs['SINR_meas'], vs['SINR_pred']):.4f}")
     else:
         print("\n⚠ No SINR column found in DT file.")
 
@@ -579,7 +610,15 @@ def main(args):
 
     if args.calibrate and drive_df is not None:
         print("📌 Calibrating K1/K2 from drive-test data...")
-        for cid in unique_cells:
+        total_calibration_cells = len(unique_cells)
+        calibrated_count = 0
+        skipped_count = 0
+        for idx, cid in enumerate(unique_cells, start=1):
+            print(
+                f"[LTE][CALIBRATION_PROGRESS] current={idx}/{total_calibration_cells} "
+                f"cell={cid} calibrated_done={calibrated_count} skipped={skipped_count} "
+                f"remaining={total_calibration_cells - idx}"
+            )
             site_rows_tmp = site_df[site_df["Node_Cell_ID"] == cid].copy()
             cell_dt_tmp   = (drive_df[drive_df["Node_Cell_ID"] == cid].copy()
                              if "Node_Cell_ID" in drive_df.columns
@@ -599,17 +638,27 @@ def main(args):
                     clat = site_rows_tmp["lat"].mean()
                     clon = site_rows_tmp["lon"].mean()
                     calibrated_params[cid] = (k1_tmp, k2_tmp, clat, clon)
+                    calibrated_count += 1
+                else:
+                    skipped_count += 1
+            else:
+                skipped_count += 1
 
         print(f"   ✔ {len(calibrated_params)} cells calibrated from DT.\n")
 
     # ── 6. RUN CELL-WISE PREDICTION ─────────────────────────────
     final_list = []
 
-    for cid in unique_cells:
+    total_prediction_cells = len(unique_cells)
+    for idx, cid in enumerate(unique_cells, start=1):
         print("----------------------------------------------------")
         print(f"Processing Cell → {cid}")
         print("----------------------------------------------------")
 
+        print(
+            f"[LTE][PREDICTION_PROGRESS] current={idx}/{total_prediction_cells} "
+            f"cell={cid} completed={idx - 1} remaining={total_prediction_cells - idx}"
+        )
         site_rows = site_df[site_df["Node_Cell_ID"] == cid].copy()
         cell_freq = site_rows["frequency_mhz"].iloc[0]
 

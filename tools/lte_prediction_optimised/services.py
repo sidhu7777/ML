@@ -19,6 +19,26 @@ from .ml_engine import (
 # Global dictionary to track job status
 JOBS = {}
 
+
+def _metric_range(df, col):
+    if col not in df.columns:
+        return "n/a"
+    series = pd.to_numeric(df[col], errors="coerce").dropna()
+    if series.empty:
+        return "n/a"
+    return f"{series.min():.4f}..{series.max():.4f}"
+
+
+def _df_summary(stage, df):
+    print(f"[LTE_OPT][{stage}] shape={df.shape}")
+    print(f"[LTE_OPT][{stage}] columns={list(df.columns)}")
+    for col in ["Node_Cell_ID", "cell_id", "node_b_id", "site_id", "Operator"]:
+        if col in df.columns:
+            print(f"[LTE_OPT][{stage}] distinct_{col}={int(df[col].nunique(dropna=True))}")
+    for col in ["pred_rsrp", "pred_rsrq", "pred_sinr"]:
+        if col in df.columns:
+            print(f"[LTE_OPT][{stage}] range_{col}={_metric_range(df, col)}")
+
 # Database connection
 engine = {
     "india": create_engine(
@@ -52,6 +72,12 @@ class LTEPredictionService_optimised:
 
     def _run(self, job_id, cfg):
         try:
+            print(
+                f"[LTE_OPT][JOB_START] job_id={job_id} project_id={cfg['project_id']} "
+                f"region={str(cfg.get('region', 'india')).lower()} operator={cfg.get('operator', 'Airtel')} "
+                f"radius={cfg.get('radius', 500)} grid_resolution={cfg.get('grid_resolution', 10)} "
+                f"n_workers={cfg.get('n_workers')}"
+            )
             self._update(job_id, "running", "Loading baseline")
 
             project_id = cfg["project_id"]
@@ -62,15 +88,18 @@ class LTEPredictionService_optimised:
 
             # ✅ Pass the region into your fetch functions!
             baseline_df = fetch_baseline(project_id, region=region)
+            _df_summary("BASELINE_DF", baseline_df)
 
             self._update(job_id, "running", "Loading site data")
             site_df = fetch_site_data(project_id, region=region)
+            _df_summary("SITE_DF", site_df)
 
             self._update(job_id, "running", "Calculating K1/K2")
             k1k2_map = compute_k1k2(baseline_df, site_df)
 
             self._update(job_id, "running", f"Loading optimized sites for {operator}")
             opt_sites = fetch_optimized_sites(project_id, operator, region=region)
+            _df_summary("OPTIMIZED_SITE_DF", opt_sites)
 
             params = {
                 "radius": cfg.get("radius", 500),
@@ -89,6 +118,7 @@ class LTEPredictionService_optimised:
                 k1k2_map,
                 params
             )
+            _df_summary("OPTIMIZED_RF_OUTPUT_DF", optimized_df)
 
             self._update(job_id, "running", "Saving CSV")
 
@@ -97,6 +127,7 @@ class LTEPredictionService_optimised:
 
             # Format for DB 
             db_df = self._format_for_db(optimized_df, project_id, job_id, operator)
+            _df_summary("OPTIMIZED_DB_PAYLOAD", db_df)
 
             # ✅ Save to DB (Passing the region down!)
             self._save_to_db(db_df, region=region)
@@ -130,6 +161,10 @@ class LTEPredictionService_optimised:
     def _save_to_db(self, df, region="india"):
         # ✅ FIXED: Removed 'self.' because engine is a global dictionary
         current_engine = engine.get(region.lower(), engine["india"])
+        print(
+            f"[LTE_OPT][DB_WRITE] table=lte_prediction_optimised_results "
+            f"mode=append rows={len(df)} region={region}"
+        )
         
         df.to_sql(
             "lte_prediction_optimised_results",
