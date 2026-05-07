@@ -3,6 +3,9 @@ import os
 import pandas as pd
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
+from shapely.geometry import Point
+from shapely.ops import transform
+from shapely.wkt import loads as load_wkt
 
 from .Sector_wise_prediction_code_copy import run_prediction_from_api
 from .lte_ml_correction_final import run_ml_from_api
@@ -64,6 +67,135 @@ def _print_df_profile(stage, df):
     if "network" in df.columns:
         top_network = df["network"].astype(str).value_counts(dropna=False).head(5).to_dict()
         print(f"[LTE][{stage}] top_network_counts={top_network}")
+
+
+def _load_project_polygons(project_id, current_engine):
+    query = f"""
+    SELECT ST_AsText(region) AS region_wkt
+    FROM map_regions
+    WHERE tbl_project_id = {project_id}
+      AND status = 1
+    """
+
+    region_df = pd.read_sql(query, current_engine)
+    polygons = []
+    for raw_region in region_df.get("region_wkt", pd.Series(dtype=str)).dropna():
+        raw_region = str(raw_region).strip()
+        if not raw_region:
+            continue
+        try:
+            polygons.append(load_wkt(raw_region))
+        except Exception:
+            continue
+    return polygons
+
+
+def _swap_polygon_coords(polygons):
+    def _swap_xy(x, y, z=None):
+        return (y, x) if z is None else (y, x, z)
+
+    return [transform(_swap_xy, poly) for poly in polygons]
+
+
+def _filter_df_by_polygons(df, polygons):
+    if df.empty or not polygons:
+        return df
+
+    mask = []
+    for _, row in df.iterrows():
+        point = Point(row["lon"], row["lat"])
+        mask.append(any(poly.contains(point) for poly in polygons))
+    return df.loc[mask].copy()
+
+
+def _apply_drive_polygon_filter(df, project_id, current_engine):
+    polygons = _load_project_polygons(project_id, current_engine)
+    if not polygons:
+        print("[LTE][DRIVE_FETCH_POLYGON] polygons_found=0 skipped=True")
+        return df, {
+            "polygons_found": 0,
+            "rows_before": len(df),
+            "rows_after": len(df),
+            "swapped": False,
+            "skipped": True,
+        }
+
+    filtered_df = _filter_df_by_polygons(df, polygons)
+    if not filtered_df.empty:
+        stats = {
+            "polygons_found": len(polygons),
+            "rows_before": len(df),
+            "rows_after": len(filtered_df),
+            "swapped": False,
+            "skipped": False,
+        }
+        print(
+            f"[LTE][DRIVE_FETCH_POLYGON] polygons_found={stats['polygons_found']} "
+            f"rows_before={stats['rows_before']} rows_after={stats['rows_after']} "
+            f"swapped={stats['swapped']}"
+        )
+        return filtered_df, stats
+
+    swapped_polygons = _swap_polygon_coords(polygons)
+    swapped_df = _filter_df_by_polygons(df, swapped_polygons)
+    stats = {
+        "polygons_found": len(polygons),
+        "rows_before": len(df),
+        "rows_after": len(swapped_df),
+        "swapped": True,
+        "skipped": False,
+    }
+    print(
+        f"[LTE][DRIVE_FETCH_POLYGON] polygons_found={stats['polygons_found']} "
+        f"rows_before={stats['rows_before']} rows_after={stats['rows_after']} "
+        f"swapped={stats['swapped']}"
+    )
+    return swapped_df, stats
+
+
+def _apply_prediction_polygon_filter(df, project_id, current_engine):
+    polygons = _load_project_polygons(project_id, current_engine)
+    if not polygons:
+        print("[LTE][RF_OUTPUT_POLYGON] polygons_found=0 skipped=True")
+        return df, {
+            "polygons_found": 0,
+            "rows_before": len(df),
+            "rows_after": len(df),
+            "swapped": False,
+            "skipped": True,
+        }
+
+    filtered_df = _filter_df_by_polygons(df, polygons)
+    if not filtered_df.empty:
+        stats = {
+            "polygons_found": len(polygons),
+            "rows_before": len(df),
+            "rows_after": len(filtered_df),
+            "swapped": False,
+            "skipped": False,
+        }
+        print(
+            f"[LTE][RF_OUTPUT_POLYGON] polygons_found={stats['polygons_found']} "
+            f"rows_before={stats['rows_before']} rows_after={stats['rows_after']} "
+            f"swapped={stats['swapped']}"
+        )
+        return filtered_df, stats
+
+    swapped_polygons = _swap_polygon_coords(polygons)
+    swapped_df = _filter_df_by_polygons(df, swapped_polygons)
+    stats = {
+        "polygons_found": len(polygons),
+        "rows_before": len(df),
+        "rows_after": len(swapped_df),
+        "swapped": True,
+        "skipped": False,
+    }
+    print(
+        f"[LTE][RF_OUTPUT_POLYGON] polygons_found={stats['polygons_found']} "
+        f"rows_before={stats['rows_before']} rows_after={stats['rows_after']} "
+        f"swapped={stats['swapped']}"
+    )
+    return swapped_df, stats
 
 
 def _resolve_operator(df):
@@ -143,62 +275,109 @@ def fetch_site_data(project_id, region="india"):
     return df, _resolve_operator(df)
 
 
-def fetch_drive_data(session_ids, operator, region="india"):
+def fetch_drive_data(session_ids, operator, project_id, region="india"):
     session_str = ",".join(map(str, session_ids))
-    key = f"{operator}_{session_str}"
+    key = f"{project_id}_{operator}_{session_str}"
     path = f"cache/drive_{key}.parquet"
+    required_drive_cols = {"cell_id", "nodeb_id"}
 
     if os.path.exists(path):
         print("[LTE][DRIVE_FETCH_CACHE] cache_hit=True")
         cached = pd.read_parquet(path)
-        _print_fetch_summary(
-            "DRIVE_FETCH_CACHE",
-            "cache/drive parquet",
-            {"session_ids": session_ids, "operator": operator, "region": region},
-            cached,
-            extra={
-                "distinct_sessions_requested": len(session_ids),
-                "lat_range": _safe_minmax(cached, "lat"),
-                "lon_range": _safe_minmax(cached, "lon"),
-            }
+        missing_cache_cols = sorted(required_drive_cols - set(cached.columns))
+        if not missing_cache_cols:
+            cached["cell_id"] = cached["cell_id"].astype(str).str.strip()
+            cached["nodeb_id"] = cached["nodeb_id"].astype(str).str.strip()
+            _print_fetch_summary(
+                "DRIVE_FETCH_CACHE",
+                "cache/drive parquet",
+                {
+                    "session_ids": session_ids,
+                    "operator": operator,
+                    "project_id": project_id,
+                    "region": region
+                },
+                cached,
+                extra={
+                    "distinct_sessions_requested": len(session_ids),
+                    "lat_range": _safe_minmax(cached, "lat"),
+                    "lon_range": _safe_minmax(cached, "lon"),
+                }
+            )
+            return cached
+
+        print(
+            f"[LTE][DRIVE_FETCH_CACHE] refreshing_cache_missing_columns={missing_cache_cols}"
         )
-        return cached
 
     current_engine = engine.get(region.lower(), engine["india"])
 
     main_query = f"""
-    SELECT lat, lon, rsrp, rsrq, sinr
+    SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
+    FROM tbl_network_log
+    WHERE session_id IN ({session_str})
+    AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+    AND LOWER(COALESCE(`primary`, '')) = 'yes'
+    """
+
+    neighbour_query = f"""
+    SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
+    FROM tbl_network_log_neighbour
+    WHERE session_id IN ({session_str})
+    AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+    AND LOWER(COALESCE(`primary`, '')) = 'yes'
+    """
+
+    raw_main_query = f"""
+    SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
     FROM tbl_network_log
     WHERE session_id IN ({session_str})
     AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
     """
 
-    neighbour_query = f"""
-    SELECT lat, lon, rsrp, rsrq, sinr
+    raw_neighbour_query = f"""
+    SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
     FROM tbl_network_log_neighbour
     WHERE session_id IN ({session_str})
     AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
     """
 
+    raw_main_df = pd.read_sql(raw_main_query, current_engine)
+    raw_neighbour_df = pd.read_sql(raw_neighbour_query, current_engine)
     main_df = pd.read_sql(main_query, current_engine)
     neighbour_df = pd.read_sql(neighbour_query, current_engine)
 
     _print_fetch_summary(
         "DRIVE_FETCH_MAIN",
         "tbl_network_log",
-        {"session_ids": session_ids, "operator": operator, "region": region},
+        {"session_ids": session_ids, "operator": operator, "project_id": project_id, "region": region},
         main_df,
         extra={"distinct_sessions_requested": len(session_ids)}
     )
     _print_fetch_summary(
         "DRIVE_FETCH_NEIGHBOUR",
         "tbl_network_log_neighbour",
-        {"session_ids": session_ids, "operator": operator, "region": region},
+        {"session_ids": session_ids, "operator": operator, "project_id": project_id, "region": region},
         neighbour_df,
         extra={"distinct_sessions_requested": len(session_ids)}
     )
 
+    raw_total_rows = len(raw_main_df) + len(raw_neighbour_df)
+    primary_filtered_rows = len(main_df) + len(neighbour_df)
+
     df = pd.concat([main_df, neighbour_df], ignore_index=True)
+    for col in ["cell_id", "nodeb_id", "pci", "earfcn"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    df, polygon_stats = _apply_drive_polygon_filter(df, project_id, current_engine)
+    print(
+        f"[LTE][DRIVE_FETCH_COUNTS] raw_total_rows={raw_total_rows} "
+        f"after_primary_rows={primary_filtered_rows} "
+        f"after_polygon_rows={len(df)} "
+        f"primary_removed={raw_total_rows - primary_filtered_rows} "
+        f"polygon_removed={primary_filtered_rows - len(df)} "
+        f"polygon_swapped={polygon_stats['swapped']}"
+    )
     _print_df_profile("DRIVE_FETCH_COMBINED", df)
 
     os.makedirs("cache", exist_ok=True)
@@ -209,7 +388,14 @@ def fetch_drive_data(session_ids, operator, region="india"):
 def fetch_building_data(project_id, region="india"):
     current_engine = engine.get(region.lower(), engine["india"])
     query = f"""
-    SELECT *
+    SELECT
+        id,
+        name,
+        region,
+        project_id,
+        area,
+        geometry,
+        ST_AsText(geometry) AS geometry_wkt
     FROM tbl_savepolygon
     WHERE project_id = {project_id}
     """
@@ -223,6 +409,7 @@ def fetch_building_data(project_id, region="india"):
         extra={
             "distinct_project_id": _safe_nunique(df, "project_id"),
             "non_null_region": _safe_non_null(df, "region"),
+            "non_null_geometry_wkt": _safe_non_null(df, "geometry_wkt"),
         }
     )
     return df
@@ -250,7 +437,8 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     print(
         f"[LTE][RF_INPUT] site_rows={len(site_df)} drive_rows={len(drive_df)} "
         f"building_rows={len(building_df)} radius={params['radius']} "
-        f"grid={params['grid']} workers={params['workers']}"
+        f"grid={params['grid']} workers={params['workers']} "
+        f"max_interference_sites={params.get('max_interference_sites', 50)}"
     )
     print(
         f"[LTE][RF_INPUT] unique_cells={_safe_nunique(site_df, 'cell_id')} "
@@ -271,14 +459,30 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         "ue_height": params.get("ue_height", 1.5),
         "outdir": temp_dir,
         "n_workers": params["workers"],
+        "max_interference_sites": params.get("max_interference_sites", 50),
         "calibrate": True
     })
 
     pred_df = pd.read_csv(f"{temp_dir}/prediction_ALL_SITES.csv")
+    current_engine = engine.get(params.get("region", "india").lower(), engine["india"])
+    pred_df, polygon_stats = _apply_prediction_polygon_filter(
+        pred_df, params["project_id"], current_engine
+    )
+    print(
+        f"[LTE][RF_OUTPUT_COUNTS] rows_before_polygon={polygon_stats['rows_before']} "
+        f"rows_after_polygon={len(pred_df)} "
+        f"polygon_removed={polygon_stats['rows_before'] - len(pred_df)} "
+        f"polygon_swapped={polygon_stats['swapped']}"
+    )
     _print_fetch_summary(
         "RF_OUTPUT",
         "temp_rf/prediction_ALL_SITES.csv",
-        {"radius": params["radius"], "grid": params["grid"]},
+        {
+            "radius": params["radius"],
+            "grid": params["grid"],
+            "project_id": params["project_id"],
+            "region": params.get("region", "india")
+        },
         pred_df,
         extra={
             "unique_predicted_cells": _safe_nunique(pred_df, "Node_Cell_ID"),

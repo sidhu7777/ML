@@ -10,6 +10,7 @@ def run_prediction():
 
     try:
         data = request.get_json()
+        app = current_app._get_current_object()
 
         cpu_count = multiprocessing.cpu_count()
 
@@ -21,10 +22,11 @@ def run_prediction():
             "grid_resolution": float(data.get("grid_resolution", 25)),
             "building": bool(data.get("building", True)),
             "n_workers": int(data.get("n_workers", max(1, cpu_count - 1))),
+            "max_interference_sites": int(data.get("max_interference_sites", 50)),
             "output_folder": current_app.config['OUTPUT_FOLDER']
         }
 
-        return jsonify(svc.submit(cfg))
+        return jsonify(svc.submit(app, cfg))
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500

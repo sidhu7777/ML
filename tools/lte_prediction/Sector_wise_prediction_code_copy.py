@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import atexit
 import math
 import os
 import time
@@ -51,6 +52,31 @@ BAND_TO_FREQ = {
     8: 900, 20: 800, 28: 700,
 }
 
+_PREDICTION_POOL = None
+_PREDICTION_POOL_WORKERS = None
+
+
+def _close_prediction_pool():
+    global _PREDICTION_POOL, _PREDICTION_POOL_WORKERS
+    if _PREDICTION_POOL is not None:
+        _PREDICTION_POOL.close()
+        _PREDICTION_POOL.join()
+        _PREDICTION_POOL = None
+        _PREDICTION_POOL_WORKERS = None
+
+
+def get_prediction_pool(n_workers):
+    global _PREDICTION_POOL, _PREDICTION_POOL_WORKERS
+    if _PREDICTION_POOL is None or _PREDICTION_POOL_WORKERS != n_workers:
+        _close_prediction_pool()
+        _PREDICTION_POOL = mp.Pool(n_workers)
+        _PREDICTION_POOL_WORKERS = n_workers
+        print(f"[LTE][POOL] initialized_shared_pool workers={n_workers}")
+    return _PREDICTION_POOL
+
+
+atexit.register(_close_prediction_pool)
+
 # ==========================================================
 # GEO MATH FUNCTIONS (VECTORIZED)
 # ==========================================================
@@ -72,6 +98,40 @@ def compute_bearing_vectorized(lat1, lon1, lat2, lon2):
     y = np.cos(lat1) * np.sin(lat2) - (np.sin(lat1) * np.cos(lat2) * np.cos(dlon))
     bearing = np.arctan2(x, y)
     return (np.degrees(bearing) + 360) % 360
+
+
+def select_nearest_site_rows(site_df, serving_site_rows, limit):
+    """
+    Keep the serving rows plus the geographically nearest site rows.
+    This preserves the existing prediction logic while reducing the
+    interference candidate set from the full dataset.
+    """
+    if limit is None or limit <= 0 or len(site_df) <= limit:
+        return site_df.to_dict("records")
+
+    clat = float(serving_site_rows["lat"].mean())
+    clon = float(serving_site_rows["lon"].mean())
+
+    candidate_df = site_df.copy()
+    candidate_df["_distance_m"] = haversine_vectorized(
+        clat,
+        clon,
+        candidate_df["lat"].astype(float).values,
+        candidate_df["lon"].astype(float).values
+    )
+
+    nearest_df = candidate_df.nsmallest(limit, "_distance_m").drop(columns=["_distance_m"])
+
+    serving_ids = set(serving_site_rows["Node_Cell_ID"].astype(str))
+    serving_df = candidate_df[
+        candidate_df["Node_Cell_ID"].astype(str).isin(serving_ids)
+    ].drop(columns=["_distance_m"])
+
+    combined_df = (
+        pd.concat([nearest_df, serving_df], ignore_index=True)
+        .drop_duplicates(subset=["Node_Cell_ID"], keep="first")
+    )
+    return combined_df.to_dict("records")
 
 # ==========================================================
 # 3GPP ANTENNA MODEL (VECTORIZED)
@@ -280,8 +340,13 @@ def load_building_polygons(path):
     df = pd.read_csv(path)
     df.columns = [c.strip().lower() for c in df.columns]
 
-    if "region" not in df.columns:
-        raise ValueError("❌ Column 'region' not found in building CSV")
+    geom_col = None
+    for candidate in ("geometry_wkt", "geometry", "region"):
+        if candidate in df.columns:
+            geom_col = candidate
+            break
+    if geom_col is None:
+        raise ValueError("❌ No supported geometry column found in building CSV")
 
     polygons = []
     meta     = []
@@ -300,27 +365,44 @@ def load_building_polygons(path):
                 swapped.append(f"{lon} {lat}")
         return "POLYGON((" + ",".join(swapped) + "))"
 
+    def _load_polygon(raw_value):
+        raw_text = str(raw_value).strip()
+        if raw_text.lower() in ("nan", "none", ""):
+            return None
+
+        candidates = [raw_text]
+        swapped = swap_latlon(raw_text)
+        if swapped and swapped != raw_text:
+            candidates.append(swapped)
+
+        for candidate in candidates:
+            try:
+                geom = wkt.loads(candidate)
+            except Exception:
+                continue
+
+            if geom.is_empty:
+                continue
+
+            if geom.geom_type == "Polygon":
+                return geom if geom.is_valid else geom.buffer(0)
+            if geom.geom_type == "MultiPolygon":
+                pieces = list(geom.geoms)
+                if not pieces:
+                    continue
+                poly = max(pieces, key=lambda g: g.area)
+                return poly if poly.is_valid else poly.buffer(0)
+        return None
+
     skipped = 0
-    for idx, row in df.iterrows():
-        raw = str(row["region"]).strip()
-        if raw.lower() in ("nan", "none", ""):
+    for _, row in df.iterrows():
+        poly = _load_polygon(row[geom_col])
+        if poly is None or poly.is_empty or not poly.is_valid:
             skipped += 1
             continue
 
-        fixed = swap_latlon(raw)
-        if not fixed:
-            skipped += 1
-            continue
-
-        try:
-            poly = wkt.loads(fixed)
-            if poly.is_valid:
-                polygons.append(poly)
-                meta.append({"loss": 15.0})
-            else:
-                skipped += 1
-        except:
-            skipped += 1
+        polygons.append(poly)
+        meta.append({"loss": 15.0})
 
     print(f"✔ Loaded {len(polygons)} building polygons (skipped {skipped})")
     return polygons, meta
@@ -437,7 +519,7 @@ def generate_grid(site_rows, radius_m=5000, res=25):
 # PARALLEL PROCESSING
 # ==========================================================
 
-def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=None):
+def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=None, pool=None, use_shared_pool=False):
 
     if n_workers is None or n_workers < 1:
         n_workers = max(1, mp.cpu_count() - 1)
@@ -453,7 +535,8 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
     total_points = len(test_pts)
 
     # 🔥 SMART CHUNKING
-    chunk_size = max(1000, total_points // (n_workers * 2))
+    chunk_divisor = max(1, n_workers * 2)
+    chunk_size = max(25, math.ceil(total_points / chunk_divisor))
     print(f"[LTE][PATHLOSS] total_points={total_points} chunk_size={chunk_size}")
 
     chunks = []
@@ -465,7 +548,13 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
     all_rsrp, all_rsrq, all_sinr = [], [], []
 
     # 🔥 FAST MULTIPROCESSING
-    with mp.Pool(n_workers) as pool:
+    if pool is None and use_shared_pool:
+        pool = get_prediction_pool(n_workers)
+
+    if pool is None:
+        with mp.Pool(n_workers) as local_pool:
+            results = local_pool.map(process_chunk_3gpp_antenna, chunks)
+    else:
         results = pool.map(process_chunk_3gpp_antenna, chunks)
 
     for r, q, s in results:
@@ -483,7 +572,7 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
 # ACCURACY REPORT
 # ==========================================================
 
-def generate_accuracy_report(drive_df, site_df, params):
+def generate_accuracy_report(drive_df, site_df, params, pool=None):
     print("\n" + "="*60)
     print("GAUGE ACCURACY: MEASURED VS PREDICTED")
     print("="*60)
@@ -506,7 +595,7 @@ def generate_accuracy_report(drive_df, site_df, params):
 
     # Use ALL sites for interference during accuracy check too
     rsrp_pred, rsrq_pred, sinr_pred = compute_predictions_parallel(
-        dt, site_df, params, n_workers=params.get('n_workers', 5)
+        dt, site_df, params, n_workers=params.get('n_workers', 5), pool=pool, use_shared_pool=(pool is None)
     )
 
     dt["RSRP_pred"] = rsrp_pred
@@ -606,7 +695,12 @@ def main(args):
     # ── 5. CALIBRATE K1/K2 PER CELL ────────────────────────────
     calibrated_params = {}
     unique_cells = site_df["Node_Cell_ID"].unique()
-    site_df_records = site_df.to_dict('records')
+    drive_groups = (
+        drive_df.groupby("Node_Cell_ID")
+        if drive_df is not None and "Node_Cell_ID" in drive_df.columns
+        else None
+    )
+    max_interference_sites = int(getattr(args, "max_interference_sites", 50))
 
     if args.calibrate and drive_df is not None:
         print("📌 Calibrating K1/K2 from drive-test data...")
@@ -614,15 +708,17 @@ def main(args):
         calibrated_count = 0
         skipped_count = 0
         for idx, cid in enumerate(unique_cells, start=1):
+            calibration_start = time.perf_counter()
             print(
                 f"[LTE][CALIBRATION_PROGRESS] current={idx}/{total_calibration_cells} "
                 f"cell={cid} calibrated_done={calibrated_count} skipped={skipped_count} "
                 f"remaining={total_calibration_cells - idx}"
             )
             site_rows_tmp = site_df[site_df["Node_Cell_ID"] == cid].copy()
-            cell_dt_tmp   = (drive_df[drive_df["Node_Cell_ID"] == cid].copy()
-                             if "Node_Cell_ID" in drive_df.columns
-                             else drive_df.copy())
+            if drive_groups is not None and cid in drive_groups.groups:
+                cell_dt_tmp = drive_groups.get_group(cid).copy()
+            else:
+                cell_dt_tmp = drive_df.copy()
 
             rcol = next((c for c in cell_dt_tmp.columns if "rsrp" in c.lower()), None)
             if rcol and len(cell_dt_tmp) > 0:
@@ -639,10 +735,25 @@ def main(args):
                     clon = site_rows_tmp["lon"].mean()
                     calibrated_params[cid] = (k1_tmp, k2_tmp, clat, clon)
                     calibrated_count += 1
+                    print(
+                        f"[LTE][CALIBRATION_TIMING] cell={cid} "
+                        f"elapsed_sec={time.perf_counter() - calibration_start:.2f} "
+                        f"status=calibrated"
+                    )
                 else:
                     skipped_count += 1
+                    print(
+                        f"[LTE][CALIBRATION_TIMING] cell={cid} "
+                        f"elapsed_sec={time.perf_counter() - calibration_start:.2f} "
+                        f"status=skipped reason=insufficient_valid_rsrp"
+                    )
             else:
                 skipped_count += 1
+                print(
+                    f"[LTE][CALIBRATION_TIMING] cell={cid} "
+                    f"elapsed_sec={time.perf_counter() - calibration_start:.2f} "
+                    f"status=skipped reason=missing_dt_for_cell"
+                )
 
         print(f"   ✔ {len(calibrated_params)} cells calibrated from DT.\n")
 
@@ -651,6 +762,7 @@ def main(args):
 
     total_prediction_cells = len(unique_cells)
     for idx, cid in enumerate(unique_cells, start=1):
+        cell_start = time.perf_counter()
         print("----------------------------------------------------")
         print(f"Processing Cell → {cid}")
         print("----------------------------------------------------")
@@ -661,6 +773,14 @@ def main(args):
         )
         site_rows = site_df[site_df["Node_Cell_ID"] == cid].copy()
         cell_freq = site_rows["frequency_mhz"].iloc[0]
+        interference_site_rows = select_nearest_site_rows(
+            site_df, site_rows, max_interference_sites
+        )
+        print(
+            f"[LTE][SITE_FILTER] cell={cid} serving_rows={len(site_rows)} "
+            f"candidate_interference_sites={len(interference_site_rows)} "
+            f"from_total_sites={len(site_df)} limit={max_interference_sites}"
+        )
 
         # ── Determine K1/K2 ──
         if args.calibrate and drive_df is not None:
@@ -700,7 +820,7 @@ def main(args):
             "frequency_mhz":  cell_freq,          # FIX #3: use real freq
             "bandwidth_mhz":  args.bandwidth,      # FIX #5: from CLI arg
             # FIX #1 ── pass ALL site rows so neighbours contribute to RSSI
-            "all_sites_rows": site_df_records,
+            "all_sites_rows": interference_site_rows,
             "n_workers": args.n_workers,
         }
 
@@ -708,7 +828,7 @@ def main(args):
         print(f"✔ Grid points: {len(pts)}")
 
         rsrp, rsrq, sinr = compute_predictions_parallel(
-            pts, site_rows, params, n_workers=args.n_workers
+            pts, site_rows, params, n_workers=args.n_workers, use_shared_pool=True
         )
 
         pts["pred_rsrp"]     = np.clip(rsrp, -140, -44)
@@ -717,6 +837,11 @@ def main(args):
         pts["Node_Cell_ID"]  = cid
 
         final_list.append(pts)
+        print(
+            f"[LTE][CELL_TIMING] cell={cid} "
+            f"elapsed_sec={time.perf_counter() - cell_start:.2f} "
+            f"grid_points={len(pts)} completed={idx}/{total_prediction_cells}"
+        )
 
     # ── 7. COMBINE & CLIP TO AREA ───────────────────────────────
     print("\nCombining all sector predictions…")
@@ -739,7 +864,9 @@ def main(args):
             "ue_height":      args.ue_height,
             "frequency_mhz":  args.frequency,
             "bandwidth_mhz":  args.bandwidth,
-            "all_sites_rows": site_df_records,      # neighbours included
+            "all_sites_rows": select_nearest_site_rows(
+                site_df, site_df, max_interference_sites
+            ),
             "n_workers":      args.n_workers,
         }
         generate_accuracy_report(drive_df, site_df, report_params)
@@ -787,6 +914,7 @@ if __name__ == "__main__":
     parser.add_argument("--ue_height",      type=float, default=1.5)
     parser.add_argument("--calibrate",      action="store_true")
     parser.add_argument("--n_workers", type=int, default=mp.cpu_count() - 1)
+    parser.add_argument("--max_interference_sites", type=int, default=50)
     parser.add_argument("--outdir",         default="./output")
 
     args = parser.parse_args()

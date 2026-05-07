@@ -2,6 +2,7 @@ import uuid
 import threading
 import pandas as pd
 import os
+import numpy as np
 from datetime import datetime
 
 from sqlalchemy import create_engine
@@ -15,14 +16,12 @@ from .ml_engine import (
     fetch_building_data
 )
 
-# 🔥 Restored your required extension import!
 from extensions import db
 
-# We only need the dictionary for the Taiwan connection now
 load_dotenv()
 engine_dict = {
     "taiwan": create_engine(
-        os.getenv("DATABASE_URL_Taiwan"), 
+        os.getenv("DATABASE_URL_Taiwan"),
         pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
     ) if os.getenv("DATABASE_URL_Taiwan") else None
 }
@@ -49,15 +48,41 @@ def _job_df_summary(stage, df):
         if col in df.columns:
             print(f"[LTE][{stage}] range_{col}={_metric_range(df, col)}")
 
+
+def _clean_text_series(series):
+    cleaned = series.astype(str).str.strip()
+    return cleaned.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA})
+
+
+def _pick_first_present(df, candidates):
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _coalesce_columns(df, target, candidates, default=None):
+    out = pd.Series([default] * len(df), index=df.index, dtype="object")
+    for col in candidates:
+        if col not in df.columns:
+            continue
+        series = df[col]
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            series = _clean_text_series(series)
+        out = out.where(out.notna(), series)
+    df[target] = out
+    return df
+
+
 class LTEPredictionService:
 
-    def submit(self, cfg):
+    def submit(self, app, cfg):
         job_id = str(uuid.uuid4())
         JOBS[job_id] = {"status": "queued"}
 
         threading.Thread(
-            target=self._run,
-            args=(job_id, cfg),
+            target=self._run_with_app_context,
+            args=(app, job_id, cfg),
             daemon=True
         ).start()
 
@@ -66,60 +91,67 @@ class LTEPredictionService:
     def get(self, job_id):
         return JOBS.get(job_id)
 
+    def _run_with_app_context(self, app, job_id, cfg):
+        with app.app_context():
+            self._run(job_id, cfg)
+
     def _run(self, job_id, cfg):
         try:
-            # Grab the region from your routes (defaults to india)
             region = str(cfg.get("region", "india")).lower()
             print(
                 f"[LTE][JOB_START] job_id={job_id} project_id={cfg['project_id']} "
                 f"region={region} session_ids={cfg['session_ids']} radius={cfg['radius_m']} "
-                f"grid_resolution={cfg['grid_resolution']} n_workers={cfg['n_workers']}"
+                f"grid_resolution={cfg['grid_resolution']} n_workers={cfg['n_workers']} "
+                f"max_interference_sites={cfg.get('max_interference_sites', 50)}"
             )
 
             self._update(job_id, "running", f"Fetching site data from {region.upper()} database")
 
-            # STEP 1: SITE + OPERATOR
             site_df, operator = fetch_site_data(cfg["project_id"], region=region)
             _job_df_summary("SITE_DF", site_df)
 
             self._update(job_id, "running", f"Operator: {operator}")
 
-            # STEP 2: DRIVE DATA
             self._update(job_id, "running", "Fetching drive data")
-            drive_df = fetch_drive_data(cfg["session_ids"], operator, region=region)
+            drive_df = fetch_drive_data(
+                cfg["session_ids"], operator, cfg["project_id"], region=region
+            )
             _job_df_summary("DRIVE_DF", drive_df)
 
-            # STEP 3: BUILDING DATA
             self._update(job_id, "running", "Fetching building data")
             building_df = fetch_building_data(cfg["project_id"], region=region)
             _job_df_summary("BUILDING_DF", building_df)
 
-            # 🚀 RF PREDICTION
             self._update(job_id, "running", "RF Prediction")
             pred_df = run_rf_prediction_fast(
                 site_df,
                 drive_df,
                 building_df,
                 {
+                    "project_id": cfg["project_id"],
+                    "region": region,
                     "radius": cfg["radius_m"],
                     "grid": cfg["grid_resolution"],
-                    "workers": cfg["n_workers"]
+                    "workers": cfg["n_workers"],
+                    "max_interference_sites": cfg.get("max_interference_sites", 50)
                 }
             )
 
-            # 🧠 ML CORRECTION
             _job_df_summary("RF_PRED_DF", pred_df)
             self._update(job_id, "running", "ML Correction")
             final_df = run_ml_fast(pred_df, drive_df)
             _job_df_summary("ML_OUTPUT_DF", final_df)
 
-            # 💾 SAVE OUTPUT TO DB
             self._update(job_id, "running", "Saving results to database")
-            
-            # Call the save function and pass the region!
-            self._save_baseline_results(final_df, cfg["project_id"], job_id, region=region)
+            self._save_baseline_results(
+                final_df,
+                cfg["project_id"],
+                job_id,
+                site_df=site_df,
+                operator=operator,
+                region=region
+            )
 
-            # 💾 SAVE OUTPUT (TEMP CSV)
             output = f"temp/final_{job_id}.csv"
             os.makedirs("temp", exist_ok=True)
             final_df.to_csv(output, index=False)
@@ -139,46 +171,83 @@ class LTEPredictionService:
         JOBS[job_id]["progress"] = msg
         print(f"[{job_id[:6]}] {msg}")
 
-    # Added 'region' parameter
-    def _save_baseline_results(self, df, project_id, job_id, region="india"):
-        print(f"💾 Saving baseline results to {region.upper()} DB...")
+    def _save_baseline_results(self, df, project_id, job_id, site_df=None, operator=None, region="india"):
+        print(f"Saving baseline results to {region.upper()} DB...")
 
-        # ✅ THE MAGIC FIX: Respect the db extension!
-        # If region is Taiwan, use the custom engine. Otherwise, use your db.engine.
         if region.lower() == "taiwan" and engine_dict.get("taiwan"):
             save_engine = engine_dict["taiwan"]
         else:
-            save_engine = db.engine 
+            save_engine = db.engine
 
-        # COPY DATA
         out = df.copy()
 
-        # REQUIRED COLUMN MAPPING
+        if "Node_Cell_ID" in out.columns and "node_cell_id" not in out.columns:
+            out["node_cell_id"] = out["Node_Cell_ID"]
+        if "node_cell_id" in out.columns:
+            out["node_cell_id"] = _clean_text_series(out["node_cell_id"])
+
+        # Save corrected KPI values into the baseline prediction columns.
+        out = _coalesce_columns(out, "pred_rsrp", ["ML_Corrected_RSRP", "ml_corrected_rsrp", "pred_rsrp"])
+        out = _coalesce_columns(out, "pred_rsrq", ["ML_Corrected_RSRQ", "ml_corrected_rsrq", "pred_rsrq"])
+        out = _coalesce_columns(out, "pred_sinr", ["ML_Corrected_SINR", "ml_corrected_sinr", "pred_sinr"])
+
+        if site_df is not None and not site_df.empty:
+            site_meta = site_df.copy()
+            if "Node_Cell_ID" in site_meta.columns and "node_cell_id" not in site_meta.columns:
+                site_meta["node_cell_id"] = site_meta["Node_Cell_ID"]
+            elif "cell_id" in site_meta.columns:
+                site_meta["node_cell_id"] = site_meta["cell_id"]
+
+            if "node_cell_id" in site_meta.columns:
+                site_meta["node_cell_id"] = _clean_text_series(site_meta["node_cell_id"])
+                site_id_col = _pick_first_present(site_meta, ["site_id", "Site ID", "site"])
+                operator_col = _pick_first_present(site_meta, ["operator", "network", "cluster", "Technology"])
+
+                rename_map = {}
+                if "nodeb_id" in site_meta.columns:
+                    rename_map["nodeb_id"] = "site_nodeb_id"
+                if site_id_col:
+                    rename_map[site_id_col] = "site_site_id"
+                if operator_col:
+                    rename_map[operator_col] = "site_operator"
+
+                site_meta = site_meta.rename(columns=rename_map)
+                keep_cols = ["node_cell_id"] + [
+                    col for col in ["site_nodeb_id", "site_site_id", "site_operator"] if col in site_meta.columns
+                ]
+                site_meta = site_meta[keep_cols].drop_duplicates(subset=["node_cell_id"], keep="first")
+                out = out.merge(site_meta, on="node_cell_id", how="left")
+
+        if "node_cell_id" in out.columns:
+            split_cols = out["node_cell_id"].astype(str).str.split("_", n=1, expand=True)
+            if split_cols.shape[1] >= 2:
+                out["derived_nodeb_id"] = _clean_text_series(split_cols[0])
+                out["derived_cell_id"] = _clean_text_series(split_cols[1])
+            else:
+                out["derived_nodeb_id"] = pd.NA
+                out["derived_cell_id"] = pd.NA
+        else:
+            out["derived_nodeb_id"] = pd.NA
+            out["derived_cell_id"] = pd.NA
+
         out["project_id"] = project_id
         out["job_id"] = job_id
         out["created_at"] = datetime.now()
 
-        # HANDLE MISSING COLUMNS SAFELY
-        if "nodeb_id" in out.columns:
-            out["node_b_id"] = out["nodeb_id"].astype(str)
-        else:
-            out["node_b_id"] = None
+        out = _coalesce_columns(out, "node_b_id", ["node_b_id", "nodeb_id", "site_nodeb_id", "derived_nodeb_id"])
+        out = _coalesce_columns(out, "cell_id", ["derived_cell_id", "cell_id"])
+        out = _coalesce_columns(out, "operator", ["operator", "site_operator"], default=operator)
+        out = _coalesce_columns(out, "site_id", ["site_id", "site_site_id", "node_b_id"])
 
-        if "cell_id" not in out.columns:
-            out["cell_id"] = None
+        for col in ["node_b_id", "cell_id", "operator", "site_id"]:
+            out[col] = _clean_text_series(out[col])
 
-        if "operator" not in out.columns:
-            out["operator"] = None
-
-        if "site_id" not in out.columns:
-            out["site_id"] = None
-
-        # CREATE nodeb_id_cell_id
-        out["nodeb_id_cell_id"] = (
-            out["node_b_id"].astype(str) + "_" + out["cell_id"].astype(str)
+        out["nodeb_id_cell_id"] = np.where(
+            out["node_b_id"].notna() & out["cell_id"].notna(),
+            out["node_b_id"].astype(str) + "_" + out["cell_id"].astype(str),
+            out.get("node_cell_id")
         )
 
-        # FINAL COLUMN ORDER
         final_cols = [
             "project_id",
             "job_id",
@@ -202,14 +271,13 @@ class LTEPredictionService:
             f"mode=append rows={len(out)} project_id={project_id} job_id={job_id}"
         )
 
-        # 🚀 FAST INSERT USING THE DYNAMIC ENGINE
         out.to_sql(
             "lte_prediction_baseline_results",
-            con=save_engine,  # Uses db.engine for India, engine_dict["taiwan"] for Taiwan
+            con=save_engine,
             if_exists="append",
             index=False,
             method="multi",
             chunksize=5000
         )
 
-        print(f"✅ {len(out)} rows inserted into lte_prediction_baseline_results")
+        print(f"{len(out)} rows inserted into lte_prediction_baseline_results")

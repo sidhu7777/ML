@@ -17,7 +17,8 @@ $body = @{
   region = "india"
   radius = 500
   grid_resolution = 25
-  n_workers = 8
+  n_workers = 3
+  max_interference_sites = 50
 } | ConvertTo-Json
 
 $job = Invoke-RestMethod `
