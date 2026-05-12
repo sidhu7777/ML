@@ -1,0 +1,3391 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import contextlib
+import io
+import json
+import math
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import geopandas as gpd
+import numpy as np
+import osmnx as ox
+import pandas as pd
+from pyproj import CRS, Transformer
+from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import transform, unary_union
+from shapely import wkb
+from shapely.wkt import loads as load_wkt
+from sklearn.cluster import KMeans
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.neighbors import BallTree
+from sklearn.preprocessing import StandardScaler
+
+try:
+    import rasterio
+except Exception:  # pragma: no cover - optional dependency
+    rasterio = None
+
+from tools.lte_prediction import ml_engine
+from tools.lte_prediction.Sector_wise_prediction_code_copy import (
+    compute_predictions_parallel,
+    load_building_polygons,
+    run_prediction_from_api,
+    select_nearest_site_rows,
+)
+
+
+DEFAULT_PROJECT_ID = 196
+DEFAULT_SESSION_IDS = [4187, 4178, 4180]
+DEFAULT_REGION = "india"
+DEFAULT_RADIUS_M = 500.0
+DEFAULT_GRID_RESOLUTION_M = 25.0
+DEFAULT_WORKERS = 3
+DEFAULT_MAX_INTERFERENCE_SITES = 50
+DEFAULT_TILE_SIZE_M = 100.0
+DEFAULT_CLUSTER_COUNT = 5
+DEFAULT_VALIDATION_FRACTION = 0.3
+DEFAULT_REUSE_RUN_DIR = Path("tests/output/project_196/20260508_022650")
+MAX_MAP_POINTS = 18000
+DEFAULT_DEM_RASTER_PATH: Optional[Path] = None
+DEFAULT_TERRAIN_API_URL = "https://api.opentopodata.org/v1/aster30m"
+DEFAULT_TERRAIN_API_BATCH_SIZE = 75
+DEFAULT_TERRAIN_SAMPLE_STEP_M = 30.0
+METRIC_THRESHOLDS = {
+    "RSRP_meas": (3.0, 6.0, 10.0),
+    "RSRQ_meas": (1.0, 2.0, 3.0),
+    "SINR_meas": (2.0, 4.0, 6.0),
+}
+
+GREEN_TAGS = {
+    "landuse": ["forest", "grass", "meadow", "farmland", "recreation_ground"],
+    "leisure": ["park", "garden", "nature_reserve"],
+    "natural": ["wood", "grassland", "scrub", "heath"],
+}
+
+WATER_TAGS = {
+    "natural": ["water", "wetland"],
+    "water": True,
+    "waterway": True,
+}
+
+ROAD_TAGS = {"highway": True}
+BUILDING_TAGS = {"building": True}
+
+
+class TeeStream(io.TextIOBase):
+    def __init__(self, *streams: io.TextIOBase):
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            try:
+                stream.write(text)
+            except UnicodeEncodeError:
+                encoding = getattr(stream, "encoding", None) or "utf-8"
+                safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+                stream.write(safe_text)
+            stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+@dataclass
+class RunConfig:
+    project_id: int = DEFAULT_PROJECT_ID
+    session_ids: Tuple[int, ...] = tuple(DEFAULT_SESSION_IDS)
+    region: str = DEFAULT_REGION
+    radius_m: float = DEFAULT_RADIUS_M
+    grid_resolution_m: float = DEFAULT_GRID_RESOLUTION_M
+    workers: int = DEFAULT_WORKERS
+    max_interference_sites: int = DEFAULT_MAX_INTERFERENCE_SITES
+    tile_size_m: float = DEFAULT_TILE_SIZE_M
+    cluster_count: int = DEFAULT_CLUSTER_COUNT
+    validation_fraction: float = DEFAULT_VALIDATION_FRACTION
+    enable_osm: bool = False
+    output_root: Path = Path("tests/output")
+    reuse_run_dir: Optional[Path] = DEFAULT_REUSE_RUN_DIR
+    reuse_cached_artifacts: bool = True
+    dem_raster_path: Optional[Path] = DEFAULT_DEM_RASTER_PATH
+    require_advanced_geo_on_miss: bool = True
+    terrain_api_url: str = DEFAULT_TERRAIN_API_URL
+    terrain_api_batch_size: int = DEFAULT_TERRAIN_API_BATCH_SIZE
+    terrain_sample_step_m: float = DEFAULT_TERRAIN_SAMPLE_STEP_M
+
+
+def _timestamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _metric_bundle(y_true: pd.Series, y_pred: pd.Series, metric_key: Optional[str] = None) -> Dict[str, float]:
+    y_true_num = pd.to_numeric(y_true, errors="coerce")
+    y_pred_num = pd.to_numeric(y_pred, errors="coerce")
+    err = y_true_num - y_pred_num
+    abs_err = err.abs()
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    pearson = y_true_num.corr(y_pred_num, method="pearson")
+    spearman = y_true_num.corr(y_pred_num, method="spearman")
+    metrics = {
+        "mae": round(float(mean_absolute_error(y_true, y_pred)), 4),
+        "rmse": round(rmse, 4),
+        "r2": round(float(r2_score(y_true, y_pred)), 4),
+        "bias": round(float(err.mean()), 4),
+        "p50_abs_err": round(float(abs_err.quantile(0.50)), 4),
+        "p90_abs_err": round(float(abs_err.quantile(0.90)), 4),
+        "pearson": round(float(pearson), 4) if pd.notna(pearson) else None,
+        "spearman": round(float(spearman), 4) if pd.notna(spearman) else None,
+    }
+    thresholds = METRIC_THRESHOLDS.get(metric_key or "")
+    if thresholds:
+        for threshold in thresholds:
+            metrics[f"within_{str(threshold).replace('.', '_')}"] = round(float((abs_err <= threshold).mean()), 4)
+    return metrics
+
+
+def _choose_utm_crs(gdf_4326: gpd.GeoDataFrame) -> str:
+    centroid = gdf_4326.to_crs("EPSG:4326").geometry.union_all().centroid
+    lon, lat = centroid.x, centroid.y
+    zone = int((lon + 180) // 6) + 1
+    south = lat < 0
+    return CRS.from_dict({"proj": "utm", "zone": zone, "south": south}).to_string()
+
+
+def _write_json(path: Path, payload: Dict) -> None:
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def _safe_sample(df: pd.DataFrame, limit: int = MAX_MAP_POINTS) -> pd.DataFrame:
+    if len(df) <= limit:
+        return df.copy()
+    step = max(1, math.ceil(len(df) / limit))
+    return df.iloc[::step].copy()
+
+
+def _normalize_session_ids(session_ids: Iterable[int]) -> List[int]:
+    return [int(session_id) for session_id in session_ids]
+
+
+def _coerce_optional_path(path: Optional[Path | str]) -> Optional[Path]:
+    if path is None:
+        return None
+    return Path(path)
+
+
+def _read_optional_csv(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
+
+
+def _read_optional_parquet(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    return pd.read_parquet(path)
+
+
+def _read_optional_gdf(path: Path) -> Optional[gpd.GeoDataFrame]:
+    if not path.exists():
+        return None
+    return gpd.read_file(path)
+
+
+def _read_optional_json(path: Path) -> Optional[Dict[str, object]]:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_cached_run_artifacts(reuse_run_dir: Optional[Path | str]) -> Dict[str, object]:
+    base_dir = _coerce_optional_path(reuse_run_dir)
+    if base_dir is None or not base_dir.exists():
+        return {}
+
+    building_df = _read_optional_csv(base_dir / "building_debug.csv")
+    if building_df is None:
+        building_df = _read_optional_csv(base_dir / "building_df.csv")
+
+    return {
+        "base_dir": base_dir,
+        "summary": _read_optional_json(base_dir / "summary.json"),
+        "site_df": _read_optional_csv(base_dir / "site_df.csv"),
+        "drive_df": _read_optional_csv(base_dir / "drive_df.csv"),
+        "building_df": building_df,
+        "polygon_gdf": _read_optional_gdf(base_dir / "project_polygon.geojson"),
+        "building_gdf": _read_optional_gdf(base_dir / "buildings.geojson"),
+        "grid_gdf": _read_optional_gdf(base_dir / "analysis_grid.geojson"),
+        "grid_df": _read_optional_csv(base_dir / "analysis_grid_features.csv"),
+        "pred_df": _read_optional_parquet(base_dir / "rf_prediction_grid.parquet"),
+        "rf_accuracy_points": _read_optional_csv(base_dir / "rf_accuracy_points.csv"),
+        "building_debug_csv": (base_dir / "building_debug.csv") if (base_dir / "building_debug.csv").exists() else None,
+        "rf_log_path": next(iter(sorted(base_dir.glob("run_log_*.txt"))), None),
+    }
+
+
+def _cached_config_matches(
+    config: RunConfig,
+    cached_summary: Optional[Dict[str, object]],
+    fields: Iterable[str],
+) -> tuple[bool, List[str]]:
+    if not cached_summary:
+        return False, ["summary_missing"]
+
+    cached_config = cached_summary.get("config")
+    if not isinstance(cached_config, dict):
+        return False, ["config_missing"]
+
+    mismatches: List[str] = []
+    for field in fields:
+        current_value = getattr(config, field)
+        cached_value = cached_config.get(field)
+        if field == "session_ids":
+            current_value = _normalize_session_ids(current_value)
+            cached_value = _normalize_session_ids(cached_value or [])
+        elif isinstance(current_value, Path):
+            current_value = str(current_value)
+        if current_value != cached_value:
+            mismatches.append(field)
+    return not mismatches, mismatches
+
+
+def _grid_required_feature_columns() -> List[str]:
+    return [
+        "grid_id",
+        "lat",
+        "lon",
+        "building_count",
+        "building_area_ratio",
+        "avg_building_area_m2",
+        "road_length_m",
+        "green_ratio",
+        "water_ratio",
+        "nearest_site_distance_m",
+        "mean_nearest3_site_distance_m",
+        "site_count_250m",
+        "site_count_500m",
+        "serving_distance_m",
+        "azimuth_delta_deg",
+        "clutter_class",
+        "morphology_cluster",
+        "best_interferer_distance_m",
+        "best_interferer_azimuth_delta_deg",
+        "serving_proxy_rsrp_dbm",
+        "best_interferer_proxy_rsrp_dbm",
+        "serving_proxy_rsrp_phys_dbm",
+        "best_interferer_proxy_phys_dbm",
+        "interference_gap_db",
+        "interference_ratio_linear",
+        "interference_sum_proxy_dbm",
+        "sinr_proxy_db",
+        "rsrq_proxy_db",
+        "effective_tx_height_m",
+        "los_blocker_count",
+        "los_blocked_length_m",
+        "los_blocked_ratio",
+        "mean_blocker_height_m",
+        "max_blocker_height_m",
+        "nlos_flag",
+        "diffraction_proxy_db",
+        "terrain_elevation_m",
+        "terrain_slope_deg",
+        "proxy_site_elevation_m",
+        "terrain_relief_to_site_m",
+    ]
+
+
+def _advanced_geo_feature_columns() -> List[str]:
+    return [col for col in _grid_required_feature_columns() if col not in {"grid_id", "lat", "lon", "clutter_class", "morphology_cluster"}]
+
+
+def _prediction_required_columns() -> List[str]:
+    return [
+        "lat",
+        "lon",
+        "pred_rsrp",
+        "pred_rsrq",
+        "pred_sinr",
+        "grid_id",
+    ]
+
+
+def _cached_grid_artifacts_are_usable(
+    grid_gdf: Optional[gpd.GeoDataFrame],
+    grid_df: Optional[pd.DataFrame],
+) -> tuple[bool, List[str]]:
+    issues: List[str] = []
+    if grid_gdf is None or grid_gdf.empty:
+        issues.append("grid_geometry_missing")
+    if grid_df is None or grid_df.empty:
+        issues.append("grid_features_missing")
+    if issues:
+        return False, issues
+
+    missing_cols = [col for col in _grid_required_feature_columns() if col not in grid_df.columns]
+    if missing_cols:
+        issues.append(f"grid_feature_columns_missing={missing_cols}")
+    if "grid_id" not in grid_gdf.columns:
+        issues.append("grid_geometry_missing_grid_id")
+    elif "grid_id" in grid_df.columns:
+        cached_ids = pd.Index(pd.to_numeric(grid_df["grid_id"], errors="coerce").dropna().astype(int))
+        geom_ids = pd.Index(pd.to_numeric(grid_gdf["grid_id"], errors="coerce").dropna().astype(int))
+        if set(cached_ids.tolist()) != set(geom_ids.tolist()):
+            issues.append("grid_id_mismatch")
+    return not issues, issues
+
+
+def _cached_prediction_is_usable(pred_df: Optional[pd.DataFrame]) -> tuple[bool, List[str]]:
+    issues: List[str] = []
+    if pred_df is None or pred_df.empty:
+        issues.append("prediction_missing")
+        return False, issues
+    missing_cols = [col for col in _prediction_required_columns() if col not in pred_df.columns]
+    if missing_cols:
+        issues.append(f"prediction_columns_missing={missing_cols}")
+    return not issues, issues
+
+
+def _attach_missing_grid_features_by_grid_id(pred_df: pd.DataFrame, grid_df: pd.DataFrame) -> pd.DataFrame:
+    out = pred_df.copy()
+    if "grid_id" not in out.columns or "grid_id" not in grid_df.columns:
+        return out
+
+    feature_cols = [col for col in _grid_required_feature_columns() if col != "grid_id"]
+    missing_cols = [col for col in feature_cols if col not in out.columns]
+    if not missing_cols:
+        return out
+
+    available_missing_cols = [col for col in missing_cols if col in grid_df.columns]
+    if not available_missing_cols:
+        return out
+
+    grid_features = grid_df[["grid_id"] + available_missing_cols].copy()
+    out = out.merge(grid_features, on="grid_id", how="left")
+    return out
+
+
+def _load_project_polygon_gdf(project_id: int, region: str) -> gpd.GeoDataFrame:
+    current_engine = ml_engine.engine.get(region.lower(), ml_engine.engine["india"])
+    polygons = ml_engine._load_project_polygons(project_id, current_engine)
+    if not polygons:
+        raise ValueError(f"No project polygons found for project_id={project_id}")
+    return gpd.GeoDataFrame({"geometry": polygons}, crs="EPSG:4326")
+
+
+def _swap_geometry_xy(geom):
+    return transform(lambda x, y, z=None: (y, x) if z is None else (y, x, z), geom)
+
+
+def _fetch_building_data_for_test(project_id: int, region: str) -> pd.DataFrame:
+    current_engine = ml_engine.engine.get(region.lower(), ml_engine.engine["india"])
+    query = f"""
+    SELECT
+        t.*,
+        ST_AsText(t.region) AS region_wkt,
+        ST_AsText(t.geometry) AS geometry_wkt
+    FROM tbl_savepolygon AS t
+    WHERE t.project_id = {project_id}
+    """
+    df = pd.read_sql(query, current_engine)
+    for raw_col in ["region", "geometry"]:
+        wkt_col = f"{raw_col}_wkt"
+        if raw_col in df.columns and wkt_col in df.columns:
+            parsed_from_raw = df[raw_col].apply(_parse_geometry_value)
+            needs_fill = df[wkt_col].isna() | (df[wkt_col].astype(str).str.strip() == "")
+            if needs_fill.any():
+                df.loc[needs_fill, wkt_col] = parsed_from_raw.loc[needs_fill].apply(
+                    lambda geom: geom.wkt if geom is not None and not geom.is_empty else None
+                )
+    print(f"[TEST][BUILDING_FETCH] row_count={len(df)} project_id={project_id} region={region}")
+    print(f"[TEST][BUILDING_FETCH] columns={list(df.columns)}")
+    if "region_wkt" in df.columns:
+        print(f"[TEST][BUILDING_FETCH] non_null_region_wkt={int(df['region_wkt'].notna().sum())}")
+    if "geometry_wkt" in df.columns:
+        print(f"[TEST][BUILDING_FETCH] non_null_geometry_wkt={int(df['geometry_wkt'].notna().sum())}")
+    if "region" in df.columns:
+        print(f"[TEST][BUILDING_FETCH] non_null_region={int(df['region'].notna().sum())}")
+    height_cols = _candidate_building_height_columns(df)
+    level_cols = _candidate_building_level_columns(df)
+    if height_cols:
+        print(f"[TEST][BUILDING_FETCH] building_height_columns={height_cols}")
+    if level_cols:
+        print(f"[TEST][BUILDING_FETCH] building_level_columns={level_cols}")
+    return df
+
+
+def _fetch_drive_data_for_test(
+    session_ids: Iterable[int],
+    operator: str,
+    project_id: int,
+    region: str = "india",
+) -> pd.DataFrame:
+    session_ids = tuple(int(session_id) for session_id in session_ids)
+    session_str = ",".join(map(str, session_ids))
+    current_engine = ml_engine.engine.get(region.lower(), ml_engine.engine["india"])
+
+    query = f"""
+    SELECT session_id, lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
+    FROM tbl_network_log
+    WHERE session_id IN ({session_str})
+      AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+      AND LOWER(COALESCE(`primary`, '')) = 'yes'
+    UNION ALL
+    SELECT session_id, lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
+    FROM tbl_network_log_neighbour
+    WHERE session_id IN ({session_str})
+      AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+      AND LOWER(COALESCE(`primary`, '')) = 'yes'
+    """
+    df = pd.read_sql(query, current_engine)
+    for col in ["cell_id", "nodeb_id", "pci", "earfcn"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    df, polygon_stats = ml_engine._apply_drive_polygon_filter(df, project_id, current_engine)
+    ml_engine._print_fetch_summary(
+        "DRIVE_FETCH_TEST",
+        "tbl_network_log + tbl_network_log_neighbour",
+        {"session_ids": session_ids, "operator": operator, "project_id": project_id, "region": region},
+        df,
+        extra={
+            "distinct_session_id": int(df["session_id"].nunique()) if "session_id" in df.columns else 0,
+            "lat_range": ml_engine._safe_minmax(df, "lat"),
+            "lon_range": ml_engine._safe_minmax(df, "lon"),
+            "polygon_swapped": polygon_stats["swapped"],
+        },
+    )
+    return df
+
+
+def _parse_geometry_value(raw_value):
+    if raw_value is None:
+        return None
+
+    if isinstance(raw_value, memoryview):
+        raw_value = raw_value.tobytes()
+
+    if isinstance(raw_value, (bytes, bytearray)):
+        candidates = [bytes(raw_value)]
+        text_candidate = None
+    else:
+        text_candidate = str(raw_value).strip()
+        if text_candidate.lower() in ("", "none", "nan"):
+            return None
+        candidates = []
+
+    if text_candidate:
+        try:
+            return load_wkt(text_candidate)
+        except Exception:
+            pass
+
+        if text_candidate.startswith(("b'", 'b"', 'bytearray(')):
+            try:
+                literal = ast.literal_eval(text_candidate)
+                if isinstance(literal, memoryview):
+                    literal = literal.tobytes()
+                if isinstance(literal, bytearray):
+                    literal = bytes(literal)
+                if isinstance(literal, bytes):
+                    candidates.append(literal)
+            except Exception:
+                pass
+
+        hex_candidate = text_candidate.lower()
+        if hex_candidate.startswith("0x"):
+            hex_candidate = hex_candidate[2:]
+        if hex_candidate and all(ch in "0123456789abcdef" for ch in hex_candidate):
+            try:
+                candidates.append(bytes.fromhex(hex_candidate))
+            except Exception:
+                pass
+
+    for candidate in candidates:
+        try:
+            return wkb.loads(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_site_for_rf(site_df: pd.DataFrame) -> pd.DataFrame:
+    out = site_df.copy()
+    duplicate_cols = out.columns[out.columns.duplicated()].tolist()
+    if duplicate_cols:
+        print(f"[TEST][SITE_NORMALIZE] dropping_duplicate_columns={duplicate_cols}")
+        out = out.loc[:, ~out.columns.duplicated()].copy()
+
+    if "Node_Cell_ID" not in out.columns:
+        if "cell_id" in out.columns:
+            out["Node_Cell_ID"] = out["cell_id"].astype(str).str.strip()
+        else:
+            raise ValueError("site_df is missing both Node_Cell_ID and cell_id")
+
+    alias_map = {
+        "Etilt": "electrical_tilt",
+        "Mtilt": "mechanical_tilt",
+        "Height": "antenna_height",
+        "PCI": "pci",
+    }
+    for src_col, dst_col in alias_map.items():
+        if dst_col not in out.columns and src_col in out.columns:
+            out[dst_col] = out[src_col]
+
+    numeric_defaults = {
+        "lat": None,
+        "lon": None,
+        "azimuth": 0,
+        "electrical_tilt": 3,
+        "mechanical_tilt": 0,
+        "antenna_height": 30,
+        "tx_power": 46,
+        "frequency_mhz": 1800,
+    }
+    for col, default in numeric_defaults.items():
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+            if default is not None:
+                out[col] = out[col].fillna(default)
+        elif default is not None:
+            out[col] = default
+
+    if "frequency_mhz" not in out.columns:
+        if "frequency" in out.columns:
+            out["frequency_mhz"] = pd.to_numeric(out["frequency"], errors="coerce").fillna(1800)
+        else:
+            out["frequency_mhz"] = 1800
+
+    required_cols = [
+        "lat",
+        "lon",
+        "azimuth",
+        "electrical_tilt",
+        "mechanical_tilt",
+        "antenna_height",
+        "tx_power",
+        "frequency_mhz",
+        "Node_Cell_ID",
+    ]
+    missing = [col for col in required_cols if col not in out.columns]
+    if missing:
+        raise ValueError(f"site_df is missing RF-required columns after normalization: {missing}")
+    return out
+
+
+def _feature_diagnostics(grid_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    report: Dict[str, Dict[str, float]] = {}
+    for col in [
+        "building_count",
+        "building_area_ratio",
+        "avg_building_area_m2",
+        "road_length_m",
+        "green_ratio",
+        "water_ratio",
+        "nearest_site_distance_m",
+        "mean_nearest3_site_distance_m",
+        "site_count_250m",
+        "site_count_500m",
+        "serving_distance_m",
+        "azimuth_delta_deg",
+        "best_interferer_distance_m",
+        "interference_gap_db",
+        "sinr_proxy_db",
+        "rsrq_proxy_db",
+        "effective_tx_height_m",
+        "los_blocker_count",
+        "los_blocked_ratio",
+        "diffraction_proxy_db",
+        "terrain_elevation_m",
+        "terrain_slope_deg",
+        "terrain_relief_to_site_m",
+    ]:
+        series = pd.to_numeric(grid_df.get(col, pd.Series(dtype=float)), errors="coerce").fillna(0)
+        report[col] = {
+            "non_zero": int((series != 0).sum()),
+            "nunique": int(series.nunique(dropna=True)),
+            "min": float(series.min()) if len(series) else 0.0,
+            "max": float(series.max()) if len(series) else 0.0,
+            "mean": float(series.mean()) if len(series) else 0.0,
+        }
+    return report
+
+
+def _safe_angle_delta_deg(a: pd.Series, b: pd.Series) -> pd.Series:
+    return np.abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def _haversine_m_np(lat1, lon1, lat2, lon2):
+    lat1 = np.asarray(lat1, dtype=float)
+    lon1 = np.asarray(lon1, dtype=float)
+    lat2 = np.asarray(lat2, dtype=float)
+    lon2 = np.asarray(lon2, dtype=float)
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+    return 2.0 * 6371000.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+
+def _bearing_deg_np(lat1, lon1, lat2, lon2):
+    lat1 = np.radians(np.asarray(lat1, dtype=float))
+    lon1 = np.radians(np.asarray(lon1, dtype=float))
+    lat2 = np.radians(np.asarray(lat2, dtype=float))
+    lon2 = np.radians(np.asarray(lon2, dtype=float))
+    dlon = lon2 - lon1
+    y = np.sin(dlon) * np.cos(lat2)
+    x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
+    return (np.degrees(np.arctan2(y, x)) + 360.0) % 360.0
+
+
+def _compute_proxy_rsrp_arrays(
+    point_lat,
+    point_lon,
+    site_lat,
+    site_lon,
+    site_azimuth,
+    site_height,
+    site_tx_power,
+    site_frequency_mhz,
+    site_electrical_tilt,
+    site_mechanical_tilt,
+    site_elevation_m=None,
+    point_elevation_m=None,
+    local_k2_adjust_db=0.0,
+):
+    distance_m = np.maximum(_haversine_m_np(site_lat, site_lon, point_lat, point_lon), 1.0)
+    distance_km = np.maximum(distance_m / 1000.0, 0.001)
+    freq = np.clip(np.asarray(site_frequency_mhz, dtype=float), 700.0, 3500.0)
+    h_tx = np.asarray(site_height, dtype=float)
+    if site_elevation_m is not None and point_elevation_m is not None:
+        elev_delta = np.asarray(site_elevation_m, dtype=float) - np.asarray(point_elevation_m, dtype=float)
+        h_tx = h_tx + elev_delta
+    h_tx = np.clip(h_tx, 5.0, 180.0)
+    h_rx = 1.5
+    a_hm = (1.1 * np.log10(freq) - 0.7) * h_rx - (1.56 * np.log10(freq) - 0.8)
+    slope_term = (44.9 - 6.55 * np.log10(h_tx)) + np.asarray(local_k2_adjust_db, dtype=float)
+    pathloss = (
+        46.3
+        + 33.9 * np.log10(freq)
+        - 13.82 * np.log10(h_tx)
+        - a_hm
+        + 3.0
+        + slope_term * np.log10(distance_km)
+    )
+    bearing = _bearing_deg_np(site_lat, site_lon, point_lat, point_lon)
+    az_diff = np.abs((bearing - np.asarray(site_azimuth, dtype=float) + 180.0) % 360.0 - 180.0)
+    elev_angle = np.degrees(np.arctan2(h_rx - h_tx, distance_m))
+    total_tilt = np.asarray(site_electrical_tilt, dtype=float) + np.asarray(site_mechanical_tilt, dtype=float)
+    elev_diff = np.abs(elev_angle + total_tilt)
+    ah = np.where(
+        az_diff <= 90.0,
+        np.minimum(12.0 * (az_diff / 65.0) ** 2, 25.0),
+        np.minimum(22.0 + 8.0 * np.sin(np.radians(az_diff - 90.0)) ** 2, 32.0),
+    )
+    av = np.minimum(12.0 * (elev_diff / 6.0) ** 2, 20.0)
+    gain = 18.0 - np.minimum(ah + av, 30.0)
+    tx_power = np.asarray(site_tx_power, dtype=float)
+    return tx_power + gain - pathloss - 2.0
+
+
+def _candidate_building_height_columns(df: pd.DataFrame) -> List[str]:
+    candidates = [
+        "height_m",
+        "building_height_m",
+        "building_height",
+        "height",
+        "bldg_height",
+        "roof_height",
+    ]
+    return [col for col in candidates if col in df.columns]
+
+
+def _candidate_building_level_columns(df: pd.DataFrame) -> List[str]:
+    candidates = [
+        "building_levels",
+        "levels",
+        "floors",
+        "num_floors",
+        "storeys",
+    ]
+    return [col for col in candidates if col in df.columns]
+
+
+def _offset_latlon(lat: float, lon: float, north_m: float = 0.0, east_m: float = 0.0) -> tuple[float, float]:
+    dlat = north_m / 111320.0
+    cos_lat = math.cos(math.radians(lat))
+    dlon = east_m / max(111320.0 * max(abs(cos_lat), 1e-6), 1e-6)
+    return lat + dlat, lon + dlon
+
+
+def _project_shared_cache_dir(output_root: Path, project_id: int) -> Path:
+    return _ensure_dir(output_root / f"project_{project_id}" / "shared_cache")
+
+
+def _building_df_to_gdf(building_df: pd.DataFrame) -> gpd.GeoDataFrame:
+    geom_col = None
+    for candidate in ("region_wkt", "geometry_wkt", "geometry", "region"):
+        if candidate not in building_df.columns:
+            continue
+        sample_series = building_df[candidate].dropna()
+        if sample_series.empty:
+            continue
+        sample_values = sample_series.head(10).tolist()
+        if any(_parse_geometry_value(value) is not None for value in sample_values):
+            geom_col = candidate
+            break
+    if geom_col is None:
+        return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs="EPSG:4326")
+
+    geometries = []
+    records = []
+    height_cols = _candidate_building_height_columns(building_df)
+    level_cols = _candidate_building_level_columns(building_df)
+    for _, row in building_df.iterrows():
+        geom = _parse_geometry_value(row.get(geom_col))
+        if geom is None:
+            continue
+        if geom.is_empty:
+            continue
+        if geom.geom_type == "MultiPolygon":
+            pieces = list(geom.geoms)
+            if not pieces:
+                continue
+            geom = max(pieces, key=lambda g: g.area)
+        if not geom.is_valid:
+            geom = geom.buffer(0)
+        if geom.is_empty or not geom.is_valid:
+            continue
+        geometries.append(geom)
+        records.append({
+            "id": row.get("id"),
+            "name": row.get("name"),
+            "project_id": row.get("project_id"),
+            "area_db": row.get("area"),
+            "building_height_m": next(
+                (
+                    pd.to_numeric(pd.Series([row.get(col)]), errors="coerce").iloc[0]
+                    for col in height_cols
+                    if pd.notna(pd.to_numeric(pd.Series([row.get(col)]), errors="coerce").iloc[0])
+                ),
+                np.nan,
+            ),
+            "building_levels": next(
+                (
+                    pd.to_numeric(pd.Series([row.get(col)]), errors="coerce").iloc[0]
+                    for col in level_cols
+                    if pd.notna(pd.to_numeric(pd.Series([row.get(col)]), errors="coerce").iloc[0])
+                ),
+                np.nan,
+            ),
+        })
+
+    if not geometries:
+        return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs="EPSG:4326")
+
+    gdf = gpd.GeoDataFrame(records, geometry=geometries, crs="EPSG:4326")
+    return gdf
+
+
+def _align_building_geometries_to_project(
+    building_gdf: gpd.GeoDataFrame,
+    polygon_gdf: gpd.GeoDataFrame,
+) -> tuple[gpd.GeoDataFrame, str]:
+    if building_gdf.empty or polygon_gdf.empty:
+        return building_gdf, "empty"
+
+    project_union = polygon_gdf.geometry.union_all()
+    direct = building_gdf.copy()
+    direct["_intersects"] = direct.geometry.intersects(project_union)
+    direct_hits = int(direct["_intersects"].sum())
+
+    swapped = building_gdf.copy()
+    swapped["geometry"] = swapped.geometry.apply(_swap_geometry_xy)
+    swapped["_intersects"] = swapped.geometry.intersects(project_union)
+    swapped_hits = int(swapped["_intersects"].sum())
+
+    if swapped_hits > direct_hits:
+        aligned = swapped.drop(columns=["_intersects"])
+        return aligned, f"swapped_xy direct_hits={direct_hits} swapped_hits={swapped_hits}"
+
+    aligned = direct.drop(columns=["_intersects"])
+    return aligned, f"original direct_hits={direct_hits} swapped_hits={swapped_hits}"
+
+
+def _align_project_polygon_to_points(
+    polygon_gdf: gpd.GeoDataFrame,
+    points_df: pd.DataFrame,
+) -> tuple[gpd.GeoDataFrame, str]:
+    if polygon_gdf.empty or points_df.empty or not {"lat", "lon"}.issubset(points_df.columns):
+        return polygon_gdf, "empty"
+
+    points = points_df.copy()
+    points["lat"] = pd.to_numeric(points["lat"], errors="coerce")
+    points["lon"] = pd.to_numeric(points["lon"], errors="coerce")
+    points = points.dropna(subset=["lat", "lon"]).copy()
+    if points.empty:
+        return polygon_gdf, "empty_points"
+
+    point_gdf = gpd.GeoDataFrame(
+        points[["lat", "lon"]],
+        geometry=gpd.points_from_xy(points["lon"], points["lat"]),
+        crs="EPSG:4326",
+    )
+
+    project_union = polygon_gdf.geometry.union_all()
+    direct_hits = int(point_gdf.geometry.within(project_union).sum())
+
+    swapped = polygon_gdf.copy()
+    swapped["geometry"] = swapped.geometry.apply(_swap_geometry_xy)
+    swapped_union = swapped.geometry.union_all()
+    swapped_hits = int(point_gdf.geometry.within(swapped_union).sum())
+
+    if swapped_hits > direct_hits:
+        return swapped, f"swapped_xy direct_hits={direct_hits} swapped_hits={swapped_hits}"
+    return polygon_gdf, f"original direct_hits={direct_hits} swapped_hits={swapped_hits}"
+
+
+def _prepare_building_df_for_rf(building_df: pd.DataFrame, building_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    if building_gdf.empty:
+        return building_df.copy()
+
+    rf_df = building_df.copy().reset_index(drop=True)
+    geom_count = min(len(rf_df), len(building_gdf))
+    rf_df = rf_df.iloc[:geom_count].copy()
+
+    geometry_wkt = building_gdf.geometry.to_wkt().reset_index(drop=True)
+    rf_df["region_wkt"] = geometry_wkt
+    rf_df["geometry_wkt"] = geometry_wkt
+    rf_df["geometry"] = geometry_wkt
+    rf_df["region"] = geometry_wkt
+    return rf_df
+
+
+def _prepare_site_df_for_source_rf_export(site_df: pd.DataFrame) -> pd.DataFrame:
+    rf_df = site_df.copy()
+
+    # The source predictor renames Etilt/Mtilt/Height -> electrical_tilt/mechanical_tilt/antenna_height.
+    # If we export both versions, pandas will recreate duplicate column names inside the source path.
+    duplicate_aliases = {
+        "Etilt": "electrical_tilt",
+        "Mtilt": "mechanical_tilt",
+        "Height": "antenna_height",
+        "PCI": "pci",
+    }
+    for legacy_col, normalized_col in duplicate_aliases.items():
+        if legacy_col in rf_df.columns and normalized_col in rf_df.columns:
+            rf_df = rf_df.drop(columns=[legacy_col])
+
+    return rf_df.loc[:, ~rf_df.columns.duplicated()].copy()
+
+
+def _create_analysis_grid(mask_gdf: gpd.GeoDataFrame, cell_size_m: float) -> gpd.GeoDataFrame:
+    utm_crs = _choose_utm_crs(mask_gdf)
+    mask_utm = mask_gdf.to_crs(utm_crs)
+    xmin, ymin, xmax, ymax = mask_utm.total_bounds
+
+    polygons = []
+    grid_ids = []
+    idx = 1
+    y = ymin
+    while y < ymax:
+        x = xmin
+        while x < xmax:
+            polygons.append(
+                Polygon(
+                    [(x, y), (x + cell_size_m, y), (x + cell_size_m, y + cell_size_m), (x, y + cell_size_m)]
+                )
+            )
+            grid_ids.append(idx)
+            idx += 1
+            x += cell_size_m
+        y += cell_size_m
+
+    grid_utm = gpd.GeoDataFrame({"grid_id": grid_ids, "geometry": polygons}, crs=utm_crs)
+    clipped = gpd.overlay(grid_utm, mask_utm[["geometry"]], how="intersection", keep_geom_type=False)
+    clipped = clipped[~clipped.geometry.is_empty & clipped.geometry.notnull()].copy()
+    clipped["cell_area_m2"] = clipped.geometry.area
+    return clipped.to_crs("EPSG:4326")
+
+
+def _attach_building_features(grid_gdf: gpd.GeoDataFrame, building_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    grid_utm = grid_gdf.to_crs(_choose_utm_crs(grid_gdf))
+    grid_utm["building_count"] = 0
+    grid_utm["building_area_sum_m2"] = 0.0
+
+    if building_gdf.empty:
+        grid_utm["building_area_ratio"] = 0.0
+        grid_utm["avg_building_area_m2"] = 0.0
+        return grid_utm.to_crs("EPSG:4326")
+
+    bld_utm = building_gdf.to_crs(grid_utm.crs).copy()
+    bld_utm["building_area_m2"] = bld_utm.geometry.area
+    centroids = bld_utm.copy()
+    centroids["geometry"] = centroids.geometry.centroid
+
+    joined = gpd.sjoin(
+        centroids[["building_area_m2", "geometry"]],
+        grid_utm[["grid_id", "geometry"]],
+        how="left",
+        predicate="within",
+    )
+    agg = joined.groupby("grid_id").agg(
+        building_count=("building_area_m2", "size"),
+        building_area_sum_m2=("building_area_m2", "sum"),
+        avg_building_area_m2=("building_area_m2", "mean"),
+    )
+    grid_utm = grid_utm.merge(agg, on="grid_id", how="left", suffixes=("", "_agg"))
+    for col in ("building_count", "building_area_sum_m2", "avg_building_area_m2"):
+        grid_utm[col] = grid_utm[col].fillna(0)
+    grid_utm["building_area_ratio"] = (
+        grid_utm["building_area_sum_m2"] / grid_utm["cell_area_m2"].replace(0, np.nan)
+    ).fillna(0)
+    return grid_utm.to_crs("EPSG:4326")
+
+
+def _normalize_building_height_gdf(building_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    out = building_gdf.copy()
+    if out.empty:
+        if "building_height_m" not in out.columns:
+            out["building_height_m"] = pd.Series(dtype=float)
+        return out
+
+    if "building_height_m" in out.columns:
+        out["building_height_m"] = pd.to_numeric(out["building_height_m"], errors="coerce")
+    else:
+        out["building_height_m"] = np.nan
+
+    height_source_cols = [
+        col for col in ["height_m", "height", "building:height", "building_height", "roof_height"]
+        if col in out.columns
+    ]
+    for col in height_source_cols:
+        series = pd.to_numeric(out[col], errors="coerce")
+        out["building_height_m"] = out["building_height_m"].fillna(series)
+
+    level_source_cols = [col for col in ["building_levels", "levels", "building:levels", "floors", "num_floors"] if col in out.columns]
+    for col in level_source_cols:
+        levels = pd.to_numeric(out[col], errors="coerce")
+        out["building_height_m"] = out["building_height_m"].fillna(levels * 3.0)
+    return out
+
+
+def _attach_building_path_features(points_df: pd.DataFrame, building_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    out = points_df.copy()
+    default_cols = {
+        "los_blocker_count": 0.0,
+        "los_blocked_length_m": 0.0,
+        "los_blocked_ratio": 0.0,
+        "mean_blocker_height_m": 0.0,
+        "max_blocker_height_m": 0.0,
+        "nlos_flag": 0.0,
+        "diffraction_proxy_db": 0.0,
+    }
+    for col, default in default_cols.items():
+        if col not in out.columns:
+            out[col] = default
+
+    required = {"lat", "lon", "_proxy_site_lat", "_proxy_site_lon"}
+    if out.empty or building_gdf.empty or not required.issubset(out.columns):
+        return out
+
+    building_gdf = _normalize_building_height_gdf(building_gdf)
+    utm_crs = _choose_utm_crs(building_gdf if not building_gdf.empty else gpd.GeoDataFrame(geometry=[]))
+    building_utm = building_gdf.to_crs(utm_crs).copy()
+    building_utm["building_height_m"] = pd.to_numeric(building_utm["building_height_m"], errors="coerce")
+    sindex = building_utm.sindex
+    transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+
+    blocker_count = np.zeros(len(out), dtype=float)
+    blocked_length = np.zeros(len(out), dtype=float)
+    mean_height = np.zeros(len(out), dtype=float)
+    max_height = np.zeros(len(out), dtype=float)
+
+    for row_idx, (_, row) in enumerate(out.iterrows()):
+        if any(pd.isna(row.get(col)) for col in ["lat", "lon", "_proxy_site_lat", "_proxy_site_lon"]):
+            continue
+        site_x, site_y = transformer.transform(float(row["_proxy_site_lon"]), float(row["_proxy_site_lat"]))
+        point_x, point_y = transformer.transform(float(row["lon"]), float(row["lat"]))
+        path = LineString([(site_x, site_y), (point_x, point_y)])
+        if path.length <= 0:
+            continue
+        candidate_idx = list(sindex.intersection(path.bounds))
+        if not candidate_idx:
+            continue
+        candidates = building_utm.iloc[candidate_idx]
+        hits = candidates[candidates.geometry.intersects(path)].copy()
+        if hits.empty:
+            continue
+        path_geoms = hits.geometry.intersection(path)
+        lengths = np.array([geom.length for geom in path_geoms if geom is not None and not geom.is_empty], dtype=float)
+        blocker_count[row_idx] = float(len(hits))
+        blocked_length[row_idx] = float(lengths.sum()) if len(lengths) else 0.0
+        valid_heights = pd.to_numeric(hits.get("building_height_m", pd.Series(dtype=float)), errors="coerce").dropna()
+        if not valid_heights.empty:
+            mean_height[row_idx] = float(valid_heights.mean())
+            max_height[row_idx] = float(valid_heights.max())
+
+    out["los_blocker_count"] = blocker_count
+    out["los_blocked_length_m"] = blocked_length
+    out["los_blocked_ratio"] = (
+        blocked_length / np.maximum(pd.to_numeric(out["serving_distance_m"], errors="coerce").fillna(1.0).to_numpy(dtype=float), 1.0)
+    )
+    out["mean_blocker_height_m"] = mean_height
+    out["max_blocker_height_m"] = max_height
+    out["nlos_flag"] = (out["los_blocker_count"] > 0).astype(float)
+    out["diffraction_proxy_db"] = (
+        1.4 * out["los_blocker_count"].clip(0, 8)
+        + 9.0 * out["los_blocked_ratio"].clip(0, 1.0)
+        + 0.04 * out["max_blocker_height_m"].clip(0, 80.0)
+    )
+    return out
+
+
+def _attach_dem_features(points_df: pd.DataFrame, dem_raster_path: Optional[Path | str]) -> tuple[pd.DataFrame, Dict[str, object]]:
+    out = points_df.copy()
+    dem_path = _coerce_optional_path(dem_raster_path)
+    status = {
+        "enabled": dem_path is not None,
+        "path": str(dem_path) if dem_path is not None else None,
+        "sampled": False,
+        "reason": None,
+    }
+    default_cols = ["terrain_elevation_m", "terrain_slope_deg", "proxy_site_elevation_m", "terrain_relief_to_site_m"]
+    for col in default_cols:
+        if col not in out.columns:
+            out[col] = np.nan
+
+    if dem_path is None:
+        status["reason"] = "dem_not_configured"
+        return out, status
+    if rasterio is None:
+        status["reason"] = "rasterio_unavailable"
+        return out, status
+    if not dem_path.exists():
+        status["reason"] = "dem_file_missing"
+        return out, status
+    if out.empty or not {"lat", "lon"}.issubset(out.columns):
+        status["reason"] = "points_missing"
+        return out, status
+
+    with rasterio.open(dem_path) as src:
+        if src.crs is None:
+            status["reason"] = "dem_crs_missing"
+            return out, status
+        to_dem = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+        point_xy = [to_dem.transform(float(lon), float(lat)) for lat, lon in zip(out["lat"], out["lon"])]
+        point_samples = np.array([sample[0] for sample in src.sample(point_xy)], dtype=float)
+        nodata = src.nodata
+        if nodata is not None:
+            point_samples = np.where(np.isclose(point_samples, nodata), np.nan, point_samples)
+        out["terrain_elevation_m"] = point_samples
+
+        dx = abs(float(src.transform.a)) or 1.0
+        dy = abs(float(src.transform.e)) or 1.0
+        west_xy = [(x - dx, y) for x, y in point_xy]
+        east_xy = [(x + dx, y) for x, y in point_xy]
+        south_xy = [(x, y - dy) for x, y in point_xy]
+        north_xy = [(x, y + dy) for x, y in point_xy]
+        west = np.array([sample[0] for sample in src.sample(west_xy)], dtype=float)
+        east = np.array([sample[0] for sample in src.sample(east_xy)], dtype=float)
+        south = np.array([sample[0] for sample in src.sample(south_xy)], dtype=float)
+        north = np.array([sample[0] for sample in src.sample(north_xy)], dtype=float)
+        if nodata is not None:
+            for arr in (west, east, south, north):
+                arr[np.isclose(arr, nodata)] = np.nan
+        grad_x = (east - west) / max(2.0 * dx, 1.0)
+        grad_y = (north - south) / max(2.0 * dy, 1.0)
+        out["terrain_slope_deg"] = np.degrees(np.arctan(np.sqrt(np.square(grad_x) + np.square(grad_y))))
+
+        if {"_proxy_site_lat", "_proxy_site_lon"}.issubset(out.columns):
+            site_xy = [
+                to_dem.transform(float(lon), float(lat)) if pd.notna(lat) and pd.notna(lon) else (np.nan, np.nan)
+                for lat, lon in zip(out["_proxy_site_lat"], out["_proxy_site_lon"])
+            ]
+            valid_mask = np.array([np.isfinite(x) and np.isfinite(y) for x, y in site_xy], dtype=bool)
+            site_samples = np.full(len(out), np.nan, dtype=float)
+            if valid_mask.any():
+                sampled = np.array([sample[0] for sample in src.sample([site_xy[i] for i in np.where(valid_mask)[0]])], dtype=float)
+                if nodata is not None:
+                    sampled = np.where(np.isclose(sampled, nodata), np.nan, sampled)
+                site_samples[valid_mask] = sampled
+            out["proxy_site_elevation_m"] = site_samples
+            out["terrain_relief_to_site_m"] = out["terrain_elevation_m"] - out["proxy_site_elevation_m"]
+
+    status["sampled"] = True
+    return out, status
+
+
+def _load_terrain_sample_cache(cache_path: Path) -> Dict[tuple[float, float], float]:
+    if not cache_path.exists():
+        return {}
+    try:
+        df = pd.read_csv(cache_path)
+    except Exception:
+        return {}
+    if not {"lat", "lon", "elevation_m"}.issubset(df.columns):
+        return {}
+    cache: Dict[tuple[float, float], float] = {}
+    for row in df.itertuples(index=False):
+        try:
+            cache[(round(float(row.lat), 7), round(float(row.lon), 7))] = float(row.elevation_m)
+        except Exception:
+            continue
+    return cache
+
+
+def _write_terrain_sample_cache(cache_path: Path, cache: Dict[tuple[float, float], float]) -> None:
+    rows = [
+        {"lat": key[0], "lon": key[1], "elevation_m": value}
+        for key, value in sorted(cache.items())
+    ]
+    pd.DataFrame(rows).to_csv(cache_path, index=False)
+
+
+def _fetch_remote_elevation_map(
+    coordinates: List[tuple[float, float]],
+    api_url: str,
+    batch_size: int,
+    cache_path: Path,
+) -> tuple[Dict[tuple[float, float], float], Dict[str, object]]:
+    status: Dict[str, object] = {
+        "used_remote_api": False,
+        "api_url": api_url,
+        "cache_path": str(cache_path),
+        "requested_points": len(coordinates),
+        "fetched_points": 0,
+        "reason": None,
+    }
+    coord_keys = [(round(float(lat), 7), round(float(lon), 7)) for lat, lon in coordinates]
+    sample_cache = _load_terrain_sample_cache(cache_path)
+    missing = [key for key in coord_keys if key not in sample_cache]
+    if not missing:
+        status["fetched_points"] = len(coord_keys)
+        status["reason"] = "cache_hit"
+        return sample_cache, status
+
+    if not api_url:
+        status["reason"] = "terrain_api_missing"
+        return sample_cache, status
+
+    status["used_remote_api"] = True
+    batch_size = max(1, int(batch_size))
+    for start in range(0, len(missing), batch_size):
+        batch = missing[start:start + batch_size]
+        locations = "|".join(f"{lat:.7f},{lon:.7f}" for lat, lon in batch)
+        query = urllib.parse.urlencode({"locations": locations})
+        request_url = f"{api_url}?{query}"
+        try:
+            with urllib.request.urlopen(request_url, timeout=60) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            status["reason"] = f"terrain_api_request_failed:{exc}"
+            return sample_cache, status
+
+        results = payload.get("results")
+        if not isinstance(results, list) or len(results) != len(batch):
+            status["reason"] = "terrain_api_invalid_response"
+            return sample_cache, status
+
+        for key, item in zip(batch, results):
+            elevation = item.get("elevation") if isinstance(item, dict) else None
+            if elevation is None:
+                status["reason"] = "terrain_api_missing_elevation"
+                return sample_cache, status
+            sample_cache[key] = float(elevation)
+
+    status["fetched_points"] = len(coord_keys)
+    status["reason"] = "remote_fetch_ok"
+    _write_terrain_sample_cache(cache_path, sample_cache)
+    return sample_cache, status
+
+
+def _attach_terrain_features_from_remote_api(
+    points_df: pd.DataFrame,
+    cache_dir: Path,
+    project_id: int,
+    api_url: str,
+    batch_size: int,
+    sample_step_m: float,
+) -> tuple[pd.DataFrame, Dict[str, object]]:
+    out = points_df.copy()
+    status: Dict[str, object] = {
+        "enabled": True,
+        "path": None,
+        "sampled": False,
+        "reason": None,
+        "source": "remote_api",
+    }
+    default_cols = ["terrain_elevation_m", "terrain_slope_deg", "proxy_site_elevation_m", "terrain_relief_to_site_m"]
+    for col in default_cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    if out.empty or not {"lat", "lon", "_proxy_site_lat", "_proxy_site_lon"}.issubset(out.columns):
+        status["reason"] = "points_missing"
+        return out, status
+
+    sample_step_m = max(float(sample_step_m), 5.0)
+    cache_path = cache_dir / f"terrain_samples_project_{project_id}.csv"
+    point_coords = [
+        (float(lat), float(lon))
+        for lat, lon in zip(pd.to_numeric(out["lat"], errors="coerce"), pd.to_numeric(out["lon"], errors="coerce"))
+        if pd.notna(lat) and pd.notna(lon)
+    ]
+    site_coords = [
+        (float(lat), float(lon))
+        for lat, lon in zip(
+            pd.to_numeric(out["_proxy_site_lat"], errors="coerce"),
+            pd.to_numeric(out["_proxy_site_lon"], errors="coerce"),
+        )
+        if pd.notna(lat) and pd.notna(lon)
+    ]
+    unique_point_coords = sorted({(round(lat, 7), round(lon, 7)) for lat, lon in point_coords})
+    unique_site_coords = sorted({(round(lat, 7), round(lon, 7)) for lat, lon in site_coords})
+    all_coords = [(lat, lon) for lat, lon in unique_point_coords] + [(lat, lon) for lat, lon in unique_site_coords]
+
+    sample_cache, remote_status = _fetch_remote_elevation_map(
+        all_coords,
+        api_url=api_url,
+        batch_size=batch_size,
+        cache_path=cache_path,
+    )
+    status.update(remote_status)
+    if remote_status.get("reason") not in {"cache_hit", "remote_fetch_ok"}:
+        return out, status
+
+    terrain_vals = [
+        sample_cache.get((round(float(lat), 7), round(float(lon), 7)), np.nan)
+        for lat, lon in zip(pd.to_numeric(out["lat"], errors="coerce"), pd.to_numeric(out["lon"], errors="coerce"))
+    ]
+    site_vals = [
+        sample_cache.get((round(float(lat), 7), round(float(lon), 7)), np.nan)
+        for lat, lon in zip(
+            pd.to_numeric(out["_proxy_site_lat"], errors="coerce"),
+            pd.to_numeric(out["_proxy_site_lon"], errors="coerce"),
+        )
+    ]
+    out["terrain_elevation_m"] = terrain_vals
+    out["proxy_site_elevation_m"] = site_vals
+
+    slope_vals = np.full(len(out), np.nan, dtype=float)
+    if {"grid_id", "lat", "lon"}.issubset(out.columns):
+        slope_frame = out[["grid_id", "lat", "lon", "terrain_elevation_m"]].copy()
+        slope_frame["lat"] = pd.to_numeric(slope_frame["lat"], errors="coerce")
+        slope_frame["lon"] = pd.to_numeric(slope_frame["lon"], errors="coerce")
+        slope_frame["terrain_elevation_m"] = pd.to_numeric(slope_frame["terrain_elevation_m"], errors="coerce")
+        slope_frame = slope_frame.dropna(subset=["lat", "lon", "terrain_elevation_m"]).copy()
+        if len(slope_frame) >= 3:
+            slope_gdf = gpd.GeoDataFrame(
+                slope_frame,
+                geometry=gpd.points_from_xy(slope_frame["lon"], slope_frame["lat"]),
+                crs="EPSG:4326",
+            )
+            utm_crs = _choose_utm_crs(slope_gdf)
+            slope_utm = slope_gdf.to_crs(utm_crs)
+            coords = np.c_[slope_utm.geometry.x.to_numpy(dtype=float), slope_utm.geometry.y.to_numpy(dtype=float)]
+            tree = BallTree(coords, metric="euclidean")
+            neighbor_k = min(5, len(slope_utm))
+            distances, indices = tree.query(coords, k=neighbor_k)
+            slope_by_grid: Dict[int, float] = {}
+            for row_pos, (dist_row, idx_row) in enumerate(zip(distances, indices)):
+                valid_neighbors = [
+                    (float(dist), int(idx))
+                    for dist, idx in zip(dist_row[1:], idx_row[1:])
+                    if dist > 0
+                ]
+                if not valid_neighbors:
+                    slope_by_grid[int(slope_utm.iloc[row_pos]["grid_id"])] = 0.0
+                    continue
+                elevation_diffs = [
+                    abs(
+                        float(slope_utm.iloc[row_pos]["terrain_elevation_m"])
+                        - float(slope_utm.iloc[idx]["terrain_elevation_m"])
+                    ) / max(dist, 1.0)
+                    for dist, idx in valid_neighbors
+                ]
+                grade = float(np.mean(elevation_diffs)) if elevation_diffs else 0.0
+                slope_by_grid[int(slope_utm.iloc[row_pos]["grid_id"])] = float(np.degrees(np.arctan(grade)))
+            slope_vals = pd.to_numeric(out["grid_id"], errors="coerce").map(slope_by_grid).to_numpy(dtype=float)
+    out["terrain_slope_deg"] = slope_vals
+    out["terrain_relief_to_site_m"] = (
+        pd.to_numeric(out["terrain_elevation_m"], errors="coerce")
+        - pd.to_numeric(out["proxy_site_elevation_m"], errors="coerce")
+    )
+    status["sampled"] = True
+    return out, status
+
+
+def _refine_experimental_forward_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in [
+        "serving_proxy_rsrp_phys_dbm",
+        "best_interferer_proxy_phys_dbm",
+        "serving_proxy_rsrp_dbm",
+        "best_interferer_proxy_rsrp_dbm",
+        "terrain_elevation_m",
+        "proxy_site_elevation_m",
+        "terrain_relief_to_site_m",
+        "terrain_slope_deg",
+        "los_blocker_count",
+        "los_blocked_ratio",
+        "diffraction_proxy_db",
+        "max_blocker_height_m",
+        "azimuth_delta_deg",
+        "best_interferer_azimuth_delta_deg",
+        "serving_distance_m",
+        "best_interferer_distance_m",
+        "effective_tx_height_m",
+    ]:
+        series = out[col] if col in out.columns else pd.Series(0.0, index=out.index, dtype=float)
+        out[col] = pd.to_numeric(series, errors="coerce").fillna(0.0)
+
+    relief_penalty = -0.022 * out["terrain_relief_to_site_m"].clip(lower=0.0, upper=180.0)
+    slope_penalty = -0.06 * out["terrain_slope_deg"].clip(0.0, 30.0)
+    obstruction_penalty = (
+        -0.85 * out["los_blocker_count"].clip(0.0, 8.0)
+        - 4.8 * out["los_blocked_ratio"].clip(0.0, 1.0)
+        - 0.035 * out["max_blocker_height_m"].clip(0.0, 80.0)
+        - 0.45 * out["diffraction_proxy_db"].clip(0.0, 25.0)
+    )
+    off_axis_penalty = -0.010 * out["azimuth_delta_deg"].clip(0.0, 180.0)
+    height_bonus = 0.12 * np.log1p(out["effective_tx_height_m"].clip(5.0, 180.0) - 4.0)
+    serving_physics_delta = relief_penalty + slope_penalty + obstruction_penalty + off_axis_penalty + height_bonus
+    out["serving_proxy_rsrp_phys_dbm"] = out["serving_proxy_rsrp_phys_dbm"] + serving_physics_delta
+
+    interferer_relief_penalty = -0.010 * out["terrain_relief_to_site_m"].clip(lower=0.0, upper=180.0)
+    interferer_off_axis = -0.006 * out["best_interferer_azimuth_delta_deg"].clip(0.0, 180.0)
+    interferer_distance_penalty = -0.0012 * out["best_interferer_distance_m"].clip(0.0, 1200.0)
+    out["best_interferer_proxy_phys_dbm"] = (
+        out["best_interferer_proxy_phys_dbm"]
+        + interferer_relief_penalty
+        + interferer_off_axis
+        + interferer_distance_penalty
+    )
+
+    if "interference_sum_proxy_dbm" in out.columns:
+        out["interference_sum_proxy_dbm"] = pd.to_numeric(out["interference_sum_proxy_dbm"], errors="coerce").fillna(-120.0)
+        out["interference_sum_proxy_dbm"] = out["interference_sum_proxy_dbm"] + np.minimum(
+            0.0,
+            0.45 * (out["best_interferer_proxy_phys_dbm"] - out["best_interferer_proxy_rsrp_dbm"])
+        )
+
+    out["interference_gap_db"] = out["serving_proxy_rsrp_phys_dbm"] - out["best_interferer_proxy_phys_dbm"]
+    out["interference_ratio_linear"] = np.power(
+        10.0,
+        (out["best_interferer_proxy_phys_dbm"] - out["serving_proxy_rsrp_phys_dbm"]) / 10.0,
+    )
+
+    noise_linear = 10 ** (-104.0 / 10.0)
+    serving_linear = np.power(10.0, out["serving_proxy_rsrp_phys_dbm"] / 10.0)
+    interference_linear = np.power(10.0, out["interference_sum_proxy_dbm"] / 10.0)
+    interference_linear = np.maximum(interference_linear, noise_linear)
+    out["sinr_proxy_db"] = 10.0 * np.log10(np.maximum(serving_linear, noise_linear) / interference_linear)
+    rssi_linear = serving_linear + interference_linear
+    out["rsrq_proxy_db"] = out["serving_proxy_rsrp_phys_dbm"] - (10.0 * np.log10(rssi_linear)) + 10.0 * np.log10(50.0)
+    return out
+
+
+def _ensure_required_building_source(
+    building_gdf: gpd.GeoDataFrame,
+    polygon_gdf: gpd.GeoDataFrame,
+    cache_dir: Path,
+) -> tuple[gpd.GeoDataFrame, Dict[str, object]]:
+    status: Dict[str, object] = {
+        "source": "db",
+        "fetched_from_osm": False,
+        "height_coverage_ratio": 0.0,
+    }
+    normalized = _normalize_building_height_gdf(building_gdf)
+    if not normalized.empty:
+        non_null_heights = pd.to_numeric(normalized.get("building_height_m", pd.Series(dtype=float)), errors="coerce").notna().mean()
+        status["height_coverage_ratio"] = float(non_null_heights) if pd.notna(non_null_heights) else 0.0
+        return normalized, status
+
+    osm_buildings = _fetch_osm_layer("buildings", polygon_gdf, BUILDING_TAGS, cache_dir)
+    osm_buildings = _normalize_building_height_gdf(osm_buildings)
+    status["source"] = "osm"
+    status["fetched_from_osm"] = not osm_buildings.empty
+    if not osm_buildings.empty:
+        non_null_heights = pd.to_numeric(osm_buildings.get("building_height_m", pd.Series(dtype=float)), errors="coerce").notna().mean()
+        status["height_coverage_ratio"] = float(non_null_heights) if pd.notna(non_null_heights) else 0.0
+    return osm_buildings, status
+
+
+def _advanced_geo_required_columns() -> Dict[str, List[str]]:
+    return {
+        "site_context": [
+            "serving_distance_m",
+            "azimuth_delta_deg",
+            "best_interferer_distance_m",
+            "best_interferer_azimuth_delta_deg",
+            "serving_proxy_rsrp_dbm",
+            "best_interferer_proxy_rsrp_dbm",
+            "interference_gap_db",
+            "interference_ratio_linear",
+        ],
+        "building": [
+            "los_blocker_count",
+            "los_blocked_length_m",
+            "los_blocked_ratio",
+            "mean_blocker_height_m",
+            "max_blocker_height_m",
+            "nlos_flag",
+            "diffraction_proxy_db",
+        ],
+        "terrain": [
+            "terrain_elevation_m",
+            "terrain_slope_deg",
+            "proxy_site_elevation_m",
+            "terrain_relief_to_site_m",
+        ],
+    }
+
+
+def _columns_missing_or_empty(df: pd.DataFrame, columns: Iterable[str]) -> List[str]:
+    missing: List[str] = []
+    for col in columns:
+        if col not in df.columns:
+            missing.append(col)
+            continue
+        series = pd.to_numeric(df[col], errors="coerce")
+        if series.notna().sum() == 0:
+            missing.append(col)
+    return missing
+
+
+def _validate_advanced_geo_requirements(
+    grid_df: pd.DataFrame,
+    advanced_geo_status: Dict[str, object],
+    require_advanced_geo_on_miss: bool,
+) -> None:
+    if not require_advanced_geo_on_miss:
+        return
+
+    required = _advanced_geo_required_columns()
+    site_missing = _columns_missing_or_empty(grid_df, required["site_context"])
+    building_missing = _columns_missing_or_empty(grid_df, required["building"])
+    terrain_missing = _columns_missing_or_empty(grid_df, required["terrain"])
+
+    if site_missing:
+        raise ValueError(
+            f"Advanced geo feature generation failed for site context columns: {site_missing}"
+        )
+
+    building_status = advanced_geo_status.get("building_source_status") or {}
+    if building_status.get("source") == "osm" and not building_status.get("fetched_from_osm"):
+        raise ValueError(
+            "Advanced geo feature generation failed: no building source was available from DB cache or OSM "
+            f"for LOS/NLOS enrichment. building_source_status={building_status}"
+        )
+    if building_missing:
+        raise ValueError(
+            f"Advanced geo feature generation failed for building/LOS columns: {building_missing}. "
+            f"building_source_status={building_status}"
+        )
+
+    dem_status = advanced_geo_status.get("dem_status") or {}
+    if terrain_missing:
+        raise ValueError(
+            f"Advanced geo feature generation failed for terrain columns: {terrain_missing}. "
+            f"Provide --dem-raster-path or reuse a cache that already contains terrain features. "
+            f"dem_status={dem_status}"
+        )
+
+
+def _augment_grid_with_advanced_geo_features(
+    grid_df: pd.DataFrame,
+    building_gdf: gpd.GeoDataFrame,
+    site_df: pd.DataFrame,
+    polygon_gdf: gpd.GeoDataFrame,
+    cache_dir: Path,
+    project_id: int,
+    dem_raster_path: Optional[Path | str] = None,
+    terrain_api_url: str = DEFAULT_TERRAIN_API_URL,
+    terrain_api_batch_size: int = DEFAULT_TERRAIN_API_BATCH_SIZE,
+    terrain_sample_step_m: float = DEFAULT_TERRAIN_SAMPLE_STEP_M,
+) -> tuple[pd.DataFrame, Dict[str, object]]:
+    out = grid_df.copy()
+    status: Dict[str, object] = {
+        "site_context_refreshed": False,
+        "building_path_enriched": False,
+        "building_source_status": None,
+        "dem_status": None,
+        "new_columns_added": [],
+    }
+
+    before_cols = set(out.columns)
+    out = _attach_site_context_features(out, site_df)
+    status["site_context_refreshed"] = True
+
+    building_needed = any(col not in before_cols for col in [
+        "los_blocker_count",
+        "los_blocked_length_m",
+        "los_blocked_ratio",
+        "mean_blocker_height_m",
+        "max_blocker_height_m",
+        "nlos_flag",
+        "diffraction_proxy_db",
+    ]) or bool(_columns_missing_or_empty(out, _advanced_geo_required_columns()["building"]))
+    if building_needed:
+        building_source_gdf, building_source_status = _ensure_required_building_source(
+            building_gdf,
+            polygon_gdf,
+            cache_dir,
+        )
+        status["building_source_status"] = building_source_status
+        out = _attach_building_path_features(out, building_source_gdf)
+        status["building_path_enriched"] = True
+
+    terrain_missing_before = bool(_columns_missing_or_empty(out, _advanced_geo_required_columns()["terrain"]))
+    out, dem_status = _attach_dem_features(out, dem_raster_path)
+    terrain_missing_after_raster = bool(_columns_missing_or_empty(out, _advanced_geo_required_columns()["terrain"]))
+    if terrain_missing_before and terrain_missing_after_raster:
+        out, dem_status = _attach_terrain_features_from_remote_api(
+            out,
+            cache_dir=cache_dir,
+            project_id=project_id,
+            api_url=terrain_api_url,
+            batch_size=terrain_api_batch_size,
+            sample_step_m=terrain_sample_step_m,
+        )
+    status["dem_status"] = dem_status
+    out = _refine_experimental_forward_features(out)
+    helper_cols = [
+        "_proxy_site_id",
+        "_proxy_site_lat",
+        "_proxy_site_lon",
+        "_proxy_site_azimuth",
+        "_proxy_site_height_m",
+        "_proxy_site_tx_power",
+        "_proxy_site_frequency_mhz",
+        "_proxy_site_etilt",
+        "_proxy_site_mtilt",
+    ]
+    out = out.drop(columns=helper_cols, errors="ignore")
+    status["new_columns_added"] = sorted(set(out.columns) - before_cols)
+    return out, status
+
+
+def _empty_gdf(crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs=crs)
+
+
+def _fetch_osm_layer(
+    name: str,
+    polygon_gdf: gpd.GeoDataFrame,
+    tags: Dict,
+    cache_dir: Path,
+) -> gpd.GeoDataFrame:
+    cache_path = cache_dir / f"{name}.geojson"
+    if cache_path.exists():
+        return gpd.read_file(cache_path)
+
+    ox.settings.timeout = 120
+    ox.settings.use_cache = True
+    geom = polygon_gdf.geometry.union_all()
+    try:
+        gdf = ox.features_from_polygon(geom, tags=tags)
+    except Exception as exc:
+        print(f"[TEST][OSM] layer={name} skipped reason={exc}")
+        return _empty_gdf()
+
+    if gdf.empty:
+        return _empty_gdf()
+
+    gdf = gdf.reset_index(drop=True)
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    else:
+        gdf = gdf.to_crs("EPSG:4326")
+    gdf.to_file(cache_path, driver="GeoJSON")
+    return gdf
+
+
+def _attach_line_density(grid_gdf: gpd.GeoDataFrame, line_gdf: gpd.GeoDataFrame, out_col: str) -> gpd.GeoDataFrame:
+    grid_utm = grid_gdf.to_crs(_choose_utm_crs(grid_gdf))
+    grid_utm[out_col] = 0.0
+    if line_gdf.empty:
+        return grid_utm.to_crs("EPSG:4326")
+
+    line_utm = line_gdf.to_crs(grid_utm.crs)
+    line_utm = line_utm[line_utm.geometry.type.isin(["LineString", "MultiLineString"])].copy()
+    if line_utm.empty:
+        return grid_utm.to_crs("EPSG:4326")
+
+    clipped = gpd.overlay(
+        grid_utm[["grid_id", "geometry"]],
+        line_utm[["geometry"]],
+        how="intersection",
+        keep_geom_type=False,
+    )
+    if clipped.empty:
+        return grid_utm.to_crs("EPSG:4326")
+
+    clipped[out_col] = clipped.geometry.length
+    agg = clipped.groupby("grid_id")[out_col].sum().reset_index()
+    grid_utm = grid_utm.merge(agg, on="grid_id", how="left", suffixes=("", "_agg"))
+    grid_utm[out_col] = grid_utm[out_col].fillna(0)
+    return grid_utm.to_crs("EPSG:4326")
+
+
+def _attach_polygon_area_ratio(grid_gdf: gpd.GeoDataFrame, poly_gdf: gpd.GeoDataFrame, out_col: str) -> gpd.GeoDataFrame:
+    grid_utm = grid_gdf.to_crs(_choose_utm_crs(grid_gdf))
+    grid_utm[out_col] = 0.0
+    if poly_gdf.empty:
+        return grid_utm.to_crs("EPSG:4326")
+
+    poly_utm = poly_gdf.to_crs(grid_utm.crs)
+    poly_utm = poly_utm[poly_utm.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
+    if poly_utm.empty:
+        return grid_utm.to_crs("EPSG:4326")
+
+    clipped = gpd.overlay(
+        grid_utm[["grid_id", "geometry"]],
+        poly_utm[["geometry"]],
+        how="intersection",
+        keep_geom_type=False,
+    )
+    if clipped.empty:
+        return grid_utm.to_crs("EPSG:4326")
+
+    clipped["_area_m2"] = clipped.geometry.area
+    agg = clipped.groupby("grid_id")["_area_m2"].sum().reset_index()
+    grid_utm = grid_utm.merge(agg, on="grid_id", how="left")
+    grid_utm["_area_m2"] = grid_utm["_area_m2"].fillna(0)
+    grid_utm[out_col] = (
+        grid_utm["_area_m2"] / grid_utm["cell_area_m2"].replace(0, np.nan)
+    ).fillna(0)
+    grid_utm = grid_utm.drop(columns=["_area_m2"])
+    return grid_utm.to_crs("EPSG:4326")
+
+
+def _derive_clutter_class(df: pd.DataFrame) -> pd.Series:
+    building_dense = df["building_area_ratio"] >= df["building_area_ratio"].quantile(0.75)
+    building_mid = df["building_area_ratio"] >= df["building_area_ratio"].quantile(0.40)
+    road_dense = df["road_length_m"] >= df["road_length_m"].quantile(0.75)
+    road_mid = df["road_length_m"] >= df["road_length_m"].quantile(0.40)
+
+    clutter = np.full(len(df), "Rural/Open", dtype=object)
+    clutter = np.where(df["water_ratio"] >= 0.15, "Water", clutter)
+    clutter = np.where(
+        (df["green_ratio"] >= 0.30) & (df["water_ratio"] < 0.15) & (df["building_area_ratio"] < 0.08),
+        "Vegetation",
+        clutter,
+    )
+    clutter = np.where(building_dense & road_dense, "Dense Urban", clutter)
+    clutter = np.where((clutter == "Rural/Open") & (building_mid | road_mid), "Urban", clutter)
+    clutter = np.where(
+        (clutter == "Rural/Open") & ((df["building_count"] > 0) | (df["road_length_m"] > 0)),
+        "Suburban",
+        clutter,
+    )
+    return pd.Series(clutter, index=df.index)
+
+
+def _fit_morphology_clusters(grid_df: pd.DataFrame, cluster_count: int) -> Tuple[pd.DataFrame, Optional[KMeans], Optional[StandardScaler]]:
+    feature_cols = [
+        "building_count",
+        "building_area_ratio",
+        "avg_building_area_m2",
+        "road_length_m",
+        "green_ratio",
+        "water_ratio",
+    ]
+    work = grid_df.copy()
+    for col in feature_cols:
+        series = work[col] if col in work.columns else pd.Series(0.0, index=work.index, dtype=float)
+        work[col] = pd.to_numeric(series, errors="coerce").fillna(0.0)
+
+    usable = work[feature_cols].replace([np.inf, -np.inf], 0).fillna(0)
+    if usable.empty or len(usable) < 2:
+        work["morphology_cluster"] = 0
+        return work, None, None
+
+    distinct_rows = int(usable.drop_duplicates().shape[0])
+    if distinct_rows <= 1:
+        print("[TEST][CLUSTER] feature table is constant; assigning a single morphology cluster")
+        work["morphology_cluster"] = 0
+        return work, None, None
+
+    n_clusters = max(2, min(cluster_count, len(usable), distinct_rows))
+    print(
+        f"[TEST][CLUSTER] requested_clusters={cluster_count} "
+        f"usable_rows={len(usable)} distinct_feature_rows={distinct_rows} "
+        f"effective_clusters={n_clusters}"
+    )
+    scaler = StandardScaler()
+    X = scaler.fit_transform(usable)
+    model = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
+    work["morphology_cluster"] = model.fit_predict(X)
+    return work, model, scaler
+
+
+def _build_grid_feature_frame(
+    grid_gdf: gpd.GeoDataFrame,
+    site_df: pd.DataFrame,
+    cluster_count: int,
+) -> Tuple[pd.DataFrame, gpd.GeoDataFrame, Dict[str, Dict[str, float]]]:
+    grid_df = pd.DataFrame(grid_gdf.drop(columns="geometry"))
+    grid_centroids = grid_gdf.to_crs(_choose_utm_crs(grid_gdf)).copy()
+    grid_centroids["geometry"] = grid_centroids.geometry.centroid
+    grid_centroids = grid_centroids.to_crs("EPSG:4326")
+    grid_centroids["lat"] = grid_centroids.geometry.y
+    grid_centroids["lon"] = grid_centroids.geometry.x
+
+    grid_df["lat"] = grid_centroids["lat"].values
+    grid_df["lon"] = grid_centroids["lon"].values
+    grid_site_context = _attach_site_context_features(
+        grid_centroids[["grid_id", "lat", "lon"]],
+        site_df,
+    ).drop(columns=["lat", "lon"], errors="ignore")
+    grid_df = grid_df.merge(grid_site_context, on="grid_id", how="left")
+    grid_df["clutter_class"] = _derive_clutter_class(grid_df)
+    grid_df, _, _ = _fit_morphology_clusters(grid_df, cluster_count)
+    feature_stats = _feature_diagnostics(grid_df)
+    return grid_df, grid_centroids, feature_stats
+
+
+def _run_post_rf_smoke_test(
+    pred_df: pd.DataFrame,
+    drive_df: pd.DataFrame,
+    grid_gdf: gpd.GeoDataFrame,
+    grid_df: Optional[pd.DataFrame] = None,
+) -> None:
+    smoke_pred = pred_df.head(min(len(pred_df), 3000)).copy()
+    smoke_holdout = drive_df.head(min(len(drive_df), 500)).copy()
+    smoke_pred = _assign_points_to_tiles(smoke_pred, grid_gdf)
+    if grid_df is not None:
+        smoke_pred = _attach_missing_grid_features_by_grid_id(smoke_pred, grid_df)
+    smoke_pred, _ = _apply_experimental_geo_adjustments(smoke_pred)
+    _evaluate_prediction_grid_against_holdout(smoke_holdout, smoke_pred)
+    required_cols = {"pred_rsrp_geo", "pred_rsrq_geo", "pred_sinr_geo", "grid_id"}
+    missing = sorted(required_cols.difference(smoke_pred.columns))
+    if missing:
+        raise ValueError(f"Post-RF smoke test missing expected columns: {missing}")
+    print(
+        f"[TEST][SMOKE] post_rf_pipeline_ok pred_rows={len(smoke_pred)} "
+        f"holdout_rows={len(smoke_holdout)}"
+    )
+
+
+def _run_post_rf_integrity_checks(
+    pred_df: pd.DataFrame,
+    grid_gdf: gpd.GeoDataFrame,
+    grid_df: pd.DataFrame,
+    holdout_eval: pd.DataFrame,
+) -> None:
+    if grid_gdf.empty:
+        raise ValueError("Post-RF integrity check failed: analysis grid is empty")
+    if grid_df.empty:
+        raise ValueError("Post-RF integrity check failed: analysis grid feature frame is empty")
+    if pred_df.empty:
+        raise ValueError("Post-RF integrity check failed: prediction grid is empty")
+
+    required_pred_cols = {
+        "lat",
+        "lon",
+        "pred_rsrp",
+        "pred_rsrq",
+        "pred_sinr",
+        "grid_id",
+        "pred_rsrp_geo",
+        "pred_rsrq_geo",
+        "pred_sinr_geo",
+    }
+    missing_pred_cols = sorted(required_pred_cols.difference(pred_df.columns))
+    if missing_pred_cols:
+        raise ValueError(f"Post-RF integrity check missing prediction columns: {missing_pred_cols}")
+
+    required_grid_cols = {"grid_id", "lat", "lon", "clutter_class", "morphology_cluster"}
+    missing_grid_cols = sorted(required_grid_cols.difference(grid_df.columns))
+    if missing_grid_cols:
+        raise ValueError(f"Post-RF integrity check missing grid columns: {missing_grid_cols}")
+
+    if pred_df[["lat", "lon"]].isna().any().any():
+        raise ValueError("Post-RF integrity check failed: prediction coordinates contain nulls")
+    if grid_df[["lat", "lon"]].isna().any().any():
+        raise ValueError("Post-RF integrity check failed: grid centroid coordinates contain nulls")
+    if grid_df["grid_id"].duplicated().any():
+        raise ValueError("Post-RF integrity check failed: duplicate grid_id values in grid_df")
+    if "grid_id" in pred_df.columns and pred_df["grid_id"].isna().all():
+        raise ValueError("Post-RF integrity check failed: all prediction rows are missing grid_id")
+
+    expected_holdout_cols = {"RSRP_pred", "RSRP_pred_geo"}
+    missing_holdout_cols = sorted(expected_holdout_cols.difference(holdout_eval.columns))
+    if missing_holdout_cols:
+        raise ValueError(f"Post-RF integrity check missing holdout columns: {missing_holdout_cols}")
+
+    print(
+        f"[TEST][SMOKE] integrity_ok pred_rows={len(pred_df)} "
+        f"grid_rows={len(grid_df)} holdout_rows={len(holdout_eval)}"
+    )
+
+
+def _run_artifact_write_smoke(
+    run_dir: Path,
+    pred_df: pd.DataFrame,
+    holdout_eval: pd.DataFrame,
+    grid_df: pd.DataFrame,
+) -> None:
+    smoke_dir = _ensure_dir(run_dir / "smoke_artifacts")
+    pred_sample = _safe_sample(pred_df, limit=1000)
+    holdout_sample = holdout_eval.head(min(len(holdout_eval), 300)).copy()
+    grid_sample = grid_df.head(min(len(grid_df), 300)).copy()
+
+    csv_path = smoke_dir / "pred_sample.csv"
+    parquet_path = smoke_dir / "pred_sample.parquet"
+    holdout_path = smoke_dir / "holdout_sample.csv"
+    grid_path = smoke_dir / "grid_sample.csv"
+
+    pred_sample.to_csv(csv_path, index=False)
+    holdout_sample.to_csv(holdout_path, index=False)
+    grid_sample.to_csv(grid_path, index=False)
+    pred_sample.to_parquet(parquet_path, index=False)
+
+    csv_reload = pd.read_csv(csv_path)
+    parquet_reload = pd.read_parquet(parquet_path)
+    if len(csv_reload) != len(pred_sample):
+        raise ValueError("Artifact smoke failed: CSV round-trip row count mismatch")
+    if len(parquet_reload) != len(pred_sample):
+        raise ValueError("Artifact smoke failed: Parquet round-trip row count mismatch")
+
+    print(
+        f"[TEST][SMOKE] artifact_write_ok csv_rows={len(csv_reload)} "
+        f"parquet_rows={len(parquet_reload)}"
+    )
+
+
+def _assign_points_to_tiles(points_df: pd.DataFrame, grid_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    points = points_df.copy()
+    grid_cols = [col for col in grid_gdf.columns if col != "geometry"]
+    overlap_cols = [col for col in grid_cols if col in points.columns]
+    if overlap_cols:
+        points = points.drop(columns=overlap_cols, errors="ignore")
+    point_gdf = gpd.GeoDataFrame(
+        points,
+        geometry=gpd.points_from_xy(points["lon"], points["lat"]),
+        crs="EPSG:4326",
+    )
+    joined = gpd.sjoin(point_gdf, grid_gdf, how="left", predicate="within")
+
+    missing = joined["grid_id"].isna()
+    if missing.any():
+        utm_crs = _choose_utm_crs(grid_gdf)
+        point_missing_utm = point_gdf.loc[missing, ["geometry"]].to_crs(utm_crs)
+        grid_utm = grid_gdf.to_crs(utm_crs)
+        nearest = gpd.sjoin_nearest(
+            point_missing_utm,
+            grid_utm,
+            how="left",
+            distance_col="_tile_distance",
+        ).to_crs("EPSG:4326")
+        for col in grid_gdf.columns:
+            if col == "geometry":
+                continue
+            joined.loc[missing, col] = nearest[col].values
+
+    joined = joined.drop(columns=["geometry", "index_right"], errors="ignore")
+    return pd.DataFrame(joined)
+
+
+def _attach_site_context_features(points_df: pd.DataFrame, site_df: pd.DataFrame) -> pd.DataFrame:
+    points = points_df.copy()
+    if points.empty or site_df.empty or not {"lat", "lon"}.issubset(points.columns):
+        return points
+
+    site_work = site_df.copy()
+    for col in ["lat", "lon", "azimuth"]:
+        if col in site_work.columns:
+            site_work[col] = pd.to_numeric(site_work[col], errors="coerce")
+    site_work = site_work.dropna(subset=["lat", "lon"]).copy()
+    if site_work.empty:
+        return points
+
+    def _series_or_default(frame: pd.DataFrame, col: str, default: float) -> pd.Series:
+        if col in frame.columns:
+            return pd.to_numeric(frame[col], errors="coerce").fillna(default)
+        return pd.Series(default, index=frame.index, dtype=float)
+
+    point_lat = pd.to_numeric(points["lat"], errors="coerce").to_numpy(dtype=float)
+    point_lon = pd.to_numeric(points["lon"], errors="coerce").to_numpy(dtype=float)
+    site_lat = site_work["lat"].to_numpy(dtype=float)
+    site_lon = site_work["lon"].to_numpy(dtype=float)
+
+    point_rad = np.radians(np.c_[point_lat, point_lon])
+    site_rad = np.radians(np.c_[site_lat, site_lon])
+    tree = BallTree(site_rad, metric="haversine")
+    k = min(4, len(site_work))
+    dist_rad, _ = tree.query(point_rad, k=k)
+    _, idx = tree.query(point_rad, k=k)
+    earth_radius_m = 6371000.0
+    dist_m = dist_rad * earth_radius_m
+    points["nearest_site_distance_m"] = dist_m[:, 0]
+    points["mean_nearest3_site_distance_m"] = dist_m.mean(axis=1)
+    points["site_count_250m"] = np.array([len(x) for x in tree.query_radius(point_rad, r=250.0 / earth_radius_m)])
+    points["site_count_500m"] = np.array([len(x) for x in tree.query_radius(point_rad, r=500.0 / earth_radius_m)])
+
+    nearest_rows = site_work.iloc[idx[:, 0]].reset_index(drop=True)
+    points["_proxy_site_id"] = nearest_rows["Node_Cell_ID"].astype(str).values if "Node_Cell_ID" in nearest_rows.columns else ""
+    points["_proxy_site_lat"] = pd.to_numeric(nearest_rows["lat"], errors="coerce").values
+    points["_proxy_site_lon"] = pd.to_numeric(nearest_rows["lon"], errors="coerce").values
+    points["_proxy_site_azimuth"] = _series_or_default(nearest_rows, "azimuth", 0).values
+    points["_proxy_site_height_m"] = _series_or_default(nearest_rows, "antenna_height", 30).values
+    points["_proxy_site_tx_power"] = _series_or_default(nearest_rows, "tx_power", 46).values
+    if "frequency_mhz" in nearest_rows.columns:
+        points["_proxy_site_frequency_mhz"] = _series_or_default(nearest_rows, "frequency_mhz", 1800).values
+    else:
+        points["_proxy_site_frequency_mhz"] = _series_or_default(nearest_rows, "frequency", 1800).values
+    points["_proxy_site_etilt"] = _series_or_default(nearest_rows, "electrical_tilt", 3).values
+    points["_proxy_site_mtilt"] = _series_or_default(nearest_rows, "mechanical_tilt", 0).values
+
+    proxy_bearing = _bearing_deg_np(
+        points["_proxy_site_lat"].to_numpy(dtype=float),
+        points["_proxy_site_lon"].to_numpy(dtype=float),
+        point_lat,
+        point_lon,
+    )
+    points["serving_distance_m"] = dist_m[:, 0]
+    points["azimuth_delta_deg"] = np.abs((proxy_bearing - points["_proxy_site_azimuth"].to_numpy(dtype=float) + 180.0) % 360.0 - 180.0)
+    points["serving_proxy_rsrp_dbm"] = _compute_proxy_rsrp_arrays(
+        point_lat,
+        point_lon,
+        points["_proxy_site_lat"].to_numpy(dtype=float),
+        points["_proxy_site_lon"].to_numpy(dtype=float),
+        points["_proxy_site_azimuth"].to_numpy(dtype=float),
+        points["_proxy_site_height_m"].to_numpy(dtype=float),
+        points["_proxy_site_tx_power"].to_numpy(dtype=float),
+        points["_proxy_site_frequency_mhz"].to_numpy(dtype=float),
+        points["_proxy_site_etilt"].to_numpy(dtype=float),
+        points["_proxy_site_mtilt"].to_numpy(dtype=float),
+    )
+
+    if k >= 2:
+        interferer_rows = site_work.iloc[idx[:, 1]].reset_index(drop=True)
+        points["best_interferer_distance_m"] = dist_m[:, 1]
+        interferer_azimuth = _series_or_default(interferer_rows, "azimuth", 0).to_numpy(dtype=float)
+        interferer_height = _series_or_default(interferer_rows, "antenna_height", 30).to_numpy(dtype=float)
+        interferer_tx = _series_or_default(interferer_rows, "tx_power", 46).to_numpy(dtype=float)
+        if "frequency_mhz" in interferer_rows.columns:
+            interferer_freq = _series_or_default(interferer_rows, "frequency_mhz", 1800).to_numpy(dtype=float)
+        else:
+            interferer_freq = _series_or_default(interferer_rows, "frequency", 1800).to_numpy(dtype=float)
+        interferer_etilt = _series_or_default(interferer_rows, "electrical_tilt", 3).to_numpy(dtype=float)
+        interferer_mtilt = _series_or_default(interferer_rows, "mechanical_tilt", 0).to_numpy(dtype=float)
+        interferer_bearing = _bearing_deg_np(
+            pd.to_numeric(interferer_rows["lat"], errors="coerce").to_numpy(dtype=float),
+            pd.to_numeric(interferer_rows["lon"], errors="coerce").to_numpy(dtype=float),
+            point_lat,
+            point_lon,
+        )
+        points["best_interferer_azimuth_delta_deg"] = np.abs((interferer_bearing - interferer_azimuth + 180.0) % 360.0 - 180.0)
+        points["best_interferer_proxy_rsrp_dbm"] = _compute_proxy_rsrp_arrays(
+            point_lat,
+            point_lon,
+            pd.to_numeric(interferer_rows["lat"], errors="coerce").to_numpy(dtype=float),
+            pd.to_numeric(interferer_rows["lon"], errors="coerce").to_numpy(dtype=float),
+            interferer_azimuth,
+            interferer_height,
+            interferer_tx,
+            interferer_freq,
+            interferer_etilt,
+            interferer_mtilt,
+        )
+        points["interference_gap_db"] = (
+            pd.to_numeric(points["serving_proxy_rsrp_dbm"], errors="coerce")
+            - pd.to_numeric(points["best_interferer_proxy_rsrp_dbm"], errors="coerce")
+        )
+        points["interference_ratio_linear"] = np.power(
+            10.0,
+            (
+                pd.to_numeric(points["best_interferer_proxy_rsrp_dbm"], errors="coerce")
+                - pd.to_numeric(points["serving_proxy_rsrp_dbm"], errors="coerce")
+            ) / 10.0,
+        )
+    else:
+        points["best_interferer_distance_m"] = np.nan
+        points["best_interferer_azimuth_delta_deg"] = np.nan
+        points["best_interferer_proxy_rsrp_dbm"] = np.nan
+        points["interference_gap_db"] = np.nan
+        points["interference_ratio_linear"] = np.nan
+
+    # Build a stronger forward-style proxy from multiple nearby sectors.
+    site_freq_all = (
+        _series_or_default(site_work, "frequency_mhz", 1800).to_numpy(dtype=float)
+        if "frequency_mhz" in site_work.columns
+        else _series_or_default(site_work, "frequency", 1800).to_numpy(dtype=float)
+    )
+    site_az_all = _series_or_default(site_work, "azimuth", 0).to_numpy(dtype=float)
+    site_height_all = _series_or_default(site_work, "antenna_height", 30).to_numpy(dtype=float)
+    site_tx_all = _series_or_default(site_work, "tx_power", 46).to_numpy(dtype=float)
+    site_etilt_all = _series_or_default(site_work, "electrical_tilt", 3).to_numpy(dtype=float)
+    site_mtilt_all = _series_or_default(site_work, "mechanical_tilt", 0).to_numpy(dtype=float)
+    serving_proxy_phys = np.full(len(points), np.nan, dtype=float)
+    best_interferer_phys = np.full(len(points), np.nan, dtype=float)
+    interference_sum_dbm = np.full(len(points), np.nan, dtype=float)
+    sinr_proxy_db = np.full(len(points), np.nan, dtype=float)
+    rsrq_proxy_db = np.full(len(points), np.nan, dtype=float)
+    effective_tx_height = np.full(len(points), np.nan, dtype=float)
+    noise_linear = 10 ** (-104.0 / 10.0)
+    n_rb = 50.0
+    max_candidates = min(len(site_work), 24)
+    _, all_idx = tree.query(point_rad, k=max_candidates)
+    for row_idx in range(len(points)):
+        candidate_idx = np.unique(all_idx[row_idx])
+        cand_lat = site_lat[candidate_idx]
+        cand_lon = site_lon[candidate_idx]
+        cand_az = site_az_all[candidate_idx]
+        cand_height = site_height_all[candidate_idx]
+        cand_tx = site_tx_all[candidate_idx]
+        cand_freq = site_freq_all[candidate_idx]
+        cand_etilt = site_etilt_all[candidate_idx]
+        cand_mtilt = site_mtilt_all[candidate_idx]
+        local_distances = _haversine_m_np(
+            cand_lat,
+            cand_lon,
+            np.full(len(candidate_idx), point_lat[row_idx], dtype=float),
+            np.full(len(candidate_idx), point_lon[row_idx], dtype=float),
+        )
+        local_k2_adjust = np.where(local_distances > 250.0, 2.5, 0.8)
+        rsrp_all = _compute_proxy_rsrp_arrays(
+            np.full(len(candidate_idx), point_lat[row_idx], dtype=float),
+            np.full(len(candidate_idx), point_lon[row_idx], dtype=float),
+            cand_lat,
+            cand_lon,
+            cand_az,
+            cand_height,
+            cand_tx,
+            cand_freq,
+            cand_etilt,
+            cand_mtilt,
+            local_k2_adjust_db=local_k2_adjust,
+        )
+        order = np.argsort(rsrp_all)[::-1]
+        if len(order) == 0:
+            continue
+        best_idx = int(order[0])
+        serving_proxy_phys[row_idx] = float(rsrp_all[best_idx])
+        effective_tx_height[row_idx] = float(cand_height[best_idx])
+        if len(order) > 1:
+            best_interferer_phys[row_idx] = float(rsrp_all[int(order[1])])
+        linear = np.power(10.0, rsrp_all / 10.0)
+        best_linear = linear[best_idx]
+        total_linear = float(np.sum(linear))
+        interference_linear = max(total_linear - float(best_linear) + noise_linear, noise_linear)
+        interference_sum_dbm[row_idx] = float(10.0 * np.log10(interference_linear))
+        sinr_proxy_db[row_idx] = float(10.0 * np.log10(best_linear / interference_linear))
+        rssi_dbm = float(10.0 * np.log10(total_linear + noise_linear))
+        rsrq_proxy_db[row_idx] = float(serving_proxy_phys[row_idx] - rssi_dbm + 10.0 * np.log10(n_rb))
+
+    points["serving_proxy_rsrp_phys_dbm"] = serving_proxy_phys
+    points["best_interferer_proxy_phys_dbm"] = best_interferer_phys
+    points["interference_sum_proxy_dbm"] = interference_sum_dbm
+    points["sinr_proxy_db"] = sinr_proxy_db
+    points["rsrq_proxy_db"] = rsrq_proxy_db
+    points["effective_tx_height_m"] = effective_tx_height
+    if "best_interferer_proxy_phys_dbm" in points.columns:
+        points["interference_gap_db"] = (
+            pd.to_numeric(points["serving_proxy_rsrp_phys_dbm"], errors="coerce")
+            - pd.to_numeric(points["best_interferer_proxy_phys_dbm"], errors="coerce")
+        )
+        points["interference_ratio_linear"] = np.power(
+            10.0,
+            (
+                pd.to_numeric(points["best_interferer_proxy_phys_dbm"], errors="coerce")
+                - pd.to_numeric(points["serving_proxy_rsrp_phys_dbm"], errors="coerce")
+            ) / 10.0,
+        )
+
+    if "Node_Cell_ID" in points.columns and "Node_Cell_ID" in site_work.columns:
+        serving_site = (
+            site_work.sort_values("Node_Cell_ID")
+            .drop_duplicates(subset=["Node_Cell_ID"], keep="first")
+            [["Node_Cell_ID", "lat", "lon"] + ([ "azimuth"] if "azimuth" in site_work.columns else [])]
+            .rename(columns={"lat": "serving_lat", "lon": "serving_lon", "azimuth": "serving_azimuth"})
+        )
+        points["Node_Cell_ID"] = points["Node_Cell_ID"].astype(str)
+        serving_site["Node_Cell_ID"] = serving_site["Node_Cell_ID"].astype(str)
+        points = points.merge(serving_site, on="Node_Cell_ID", how="left")
+        has_serving = points["serving_lat"].notna() & points["serving_lon"].notna()
+        if has_serving.any():
+            src_lat = pd.to_numeric(points.loc[has_serving, "serving_lat"], errors="coerce").to_numpy(dtype=float)
+            src_lon = pd.to_numeric(points.loc[has_serving, "serving_lon"], errors="coerce").to_numpy(dtype=float)
+            dst_lat = pd.to_numeric(points.loc[has_serving, "lat"], errors="coerce").to_numpy(dtype=float)
+            dst_lon = pd.to_numeric(points.loc[has_serving, "lon"], errors="coerce").to_numpy(dtype=float)
+            phi1 = np.radians(src_lat)
+            phi2 = np.radians(dst_lat)
+            dphi = np.radians(dst_lat - src_lat)
+            dlambda = np.radians(dst_lon - src_lon)
+            a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+            points.loc[has_serving, "serving_distance_m"] = 2.0 * earth_radius_m * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+            if "serving_azimuth" in points.columns:
+                y = np.sin(np.radians(dst_lon - src_lon)) * np.cos(np.radians(dst_lat))
+                x = (
+                    np.cos(np.radians(src_lat)) * np.sin(np.radians(dst_lat))
+                    - np.sin(np.radians(src_lat)) * np.cos(np.radians(dst_lat)) * np.cos(np.radians(dst_lon - src_lon))
+                )
+                bearing = (np.degrees(np.arctan2(y, x)) + 360.0) % 360.0
+                points.loc[has_serving, "azimuth_delta_deg"] = _safe_angle_delta_deg(
+                    pd.Series(bearing, index=points.index[has_serving]),
+                    pd.to_numeric(points.loc[has_serving, "serving_azimuth"], errors="coerce"),
+                )
+        points = points.drop(columns=["serving_lat", "serving_lon", "serving_azimuth"], errors="ignore")
+    return points
+
+
+def _attach_fixed_serving_sinr_rsrq_proxy(
+    points_df: pd.DataFrame,
+    site_df: pd.DataFrame,
+    max_interferers: int = 24,
+) -> pd.DataFrame:
+    out = points_df.copy()
+    required_point_cols = {"lat", "lon", "Node_Cell_ID"}
+    required_site_cols = {"lat", "lon", "Node_Cell_ID"}
+    if out.empty or site_df.empty or not required_point_cols.issubset(out.columns):
+        return out
+    if not required_site_cols.issubset(site_df.columns):
+        return out
+
+    site_work = site_df.copy()
+    for col in ["lat", "lon", "azimuth"]:
+        if col in site_work.columns:
+            site_work[col] = pd.to_numeric(site_work[col], errors="coerce")
+    site_work["Node_Cell_ID"] = site_work["Node_Cell_ID"].astype(str).str.strip()
+    site_work = site_work.dropna(subset=["lat", "lon"]).copy()
+    if site_work.empty:
+        return out
+
+    def _series_or_default(frame: pd.DataFrame, col: str, default: float) -> pd.Series:
+        if col in frame.columns:
+            return pd.to_numeric(frame[col], errors="coerce").fillna(default)
+        return pd.Series(default, index=frame.index, dtype=float)
+
+    serving_sites = (
+        site_work.sort_values("Node_Cell_ID")
+        .drop_duplicates(subset=["Node_Cell_ID"], keep="first")
+        .reset_index(drop=True)
+    )
+    if serving_sites.empty:
+        return out
+
+    serving_lookup = {cell_id: idx for idx, cell_id in enumerate(serving_sites["Node_Cell_ID"].tolist())}
+    site_lat = serving_sites["lat"].to_numpy(dtype=float)
+    site_lon = serving_sites["lon"].to_numpy(dtype=float)
+    site_az = _series_or_default(serving_sites, "azimuth", 0.0).to_numpy(dtype=float)
+    site_height = _series_or_default(serving_sites, "antenna_height", 30.0).to_numpy(dtype=float)
+    site_tx = _series_or_default(serving_sites, "tx_power", 46.0).to_numpy(dtype=float)
+    if "frequency_mhz" in serving_sites.columns:
+        site_freq = _series_or_default(serving_sites, "frequency_mhz", 1800.0).to_numpy(dtype=float)
+    else:
+        site_freq = _series_or_default(serving_sites, "frequency", 1800.0).to_numpy(dtype=float)
+    site_etilt = _series_or_default(serving_sites, "electrical_tilt", 3.0).to_numpy(dtype=float)
+    site_mtilt = _series_or_default(serving_sites, "mechanical_tilt", 0.0).to_numpy(dtype=float)
+
+    point_lat = pd.to_numeric(out["lat"], errors="coerce").to_numpy(dtype=float)
+    point_lon = pd.to_numeric(out["lon"], errors="coerce").to_numpy(dtype=float)
+    point_cells = out["Node_Cell_ID"].astype(str).str.strip().to_numpy(dtype=object)
+    point_rad = np.radians(np.c_[point_lat, point_lon])
+    site_rad = np.radians(np.c_[site_lat, site_lon])
+    tree = BallTree(site_rad, metric="haversine")
+    candidate_k = max(1, min(int(max_interferers), len(serving_sites)))
+    _, candidate_idx = tree.query(point_rad, k=candidate_k)
+    if candidate_idx.ndim == 1:
+        candidate_idx = candidate_idx.reshape(-1, 1)
+
+    sinr_proxy_db = pd.to_numeric(out.get("sinr_proxy_db"), errors="coerce").to_numpy(dtype=float)
+    rsrq_proxy_db = pd.to_numeric(out.get("rsrq_proxy_db"), errors="coerce").to_numpy(dtype=float)
+    best_interferer_proxy = pd.to_numeric(out.get("best_interferer_proxy_phys_dbm"), errors="coerce").to_numpy(dtype=float)
+    best_interferer_distance = pd.to_numeric(out.get("best_interferer_distance_m"), errors="coerce").to_numpy(dtype=float)
+    best_interferer_az_delta = pd.to_numeric(out.get("best_interferer_azimuth_delta_deg"), errors="coerce").to_numpy(dtype=float)
+    interference_sum_dbm = pd.to_numeric(out.get("interference_sum_proxy_dbm"), errors="coerce").to_numpy(dtype=float)
+    interference_gap_db = pd.to_numeric(out.get("interference_gap_db"), errors="coerce").to_numpy(dtype=float)
+    interference_ratio = pd.to_numeric(out.get("interference_ratio_linear"), errors="coerce").to_numpy(dtype=float)
+
+    noise_linear = 10 ** (-104.0 / 10.0)
+    n_rb = 50.0
+    updated_rows = 0
+
+    for row_idx, cell_id in enumerate(point_cells):
+        serving_idx = serving_lookup.get(str(cell_id))
+        if serving_idx is None or not np.isfinite(point_lat[row_idx]) or not np.isfinite(point_lon[row_idx]):
+            continue
+
+        local_candidates = np.unique(candidate_idx[row_idx]).astype(int).tolist()
+        if serving_idx not in local_candidates:
+            local_candidates.append(serving_idx)
+
+        candidate_arr = np.array(local_candidates, dtype=int)
+        cand_lat = site_lat[candidate_arr]
+        cand_lon = site_lon[candidate_arr]
+        cand_az = site_az[candidate_arr]
+        cand_height = site_height[candidate_arr]
+        cand_tx = site_tx[candidate_arr]
+        cand_freq = site_freq[candidate_arr]
+        cand_etilt = site_etilt[candidate_arr]
+        cand_mtilt = site_mtilt[candidate_arr]
+        rsrp_all = _compute_proxy_rsrp_arrays(
+            np.full(len(candidate_arr), point_lat[row_idx], dtype=float),
+            np.full(len(candidate_arr), point_lon[row_idx], dtype=float),
+            cand_lat,
+            cand_lon,
+            cand_az,
+            cand_height,
+            cand_tx,
+            cand_freq,
+            cand_etilt,
+            cand_mtilt,
+        )
+        serving_mask = candidate_arr == serving_idx
+        if not serving_mask.any():
+            continue
+
+        linear = np.power(10.0, rsrp_all / 10.0)
+        serving_linear = float(np.sum(linear[serving_mask]))
+        interference_linear_raw = float(np.sum(linear[~serving_mask]))
+        interference_linear = max(interference_linear_raw + noise_linear, noise_linear)
+        if serving_linear <= 0.0:
+            continue
+
+        sinr_proxy_db[row_idx] = float(10.0 * np.log10(serving_linear / interference_linear))
+        rssi_linear = max(serving_linear + interference_linear_raw + noise_linear, noise_linear)
+        rsrq_proxy_db[row_idx] = float(rsrp_all[serving_mask][0] - (10.0 * np.log10(rssi_linear)) + 10.0 * np.log10(n_rb))
+        interference_sum_dbm[row_idx] = float(10.0 * np.log10(interference_linear))
+
+        if (~serving_mask).any():
+            interferer_rsrp = rsrp_all[~serving_mask]
+            interferer_linear = linear[~serving_mask]
+            best_interferer_local_idx = int(np.argmax(interferer_linear))
+            best_interferer_proxy[row_idx] = float(interferer_rsrp[best_interferer_local_idx])
+
+            interferer_candidate_idx = candidate_arr[~serving_mask][best_interferer_local_idx]
+            best_interferer_distance[row_idx] = float(
+                _haversine_m_np(
+                    site_lat[interferer_candidate_idx],
+                    site_lon[interferer_candidate_idx],
+                    point_lat[row_idx],
+                    point_lon[row_idx],
+                )
+            )
+            interferer_bearing = float(
+                _bearing_deg_np(
+                    site_lat[interferer_candidate_idx],
+                    site_lon[interferer_candidate_idx],
+                    point_lat[row_idx],
+                    point_lon[row_idx],
+                )
+            )
+            best_interferer_az_delta[row_idx] = float(
+                abs((interferer_bearing - site_az[interferer_candidate_idx] + 180.0) % 360.0 - 180.0)
+            )
+            serving_rsrp = float(rsrp_all[serving_mask][0])
+            interference_gap_db[row_idx] = serving_rsrp - best_interferer_proxy[row_idx]
+            interference_ratio[row_idx] = float(
+                np.power(10.0, (best_interferer_proxy[row_idx] - serving_rsrp) / 10.0)
+            )
+        updated_rows += 1
+
+    out["sinr_proxy_db"] = sinr_proxy_db
+    out["rsrq_proxy_db"] = rsrq_proxy_db
+    out["best_interferer_proxy_phys_dbm"] = best_interferer_proxy
+    out["best_interferer_distance_m"] = best_interferer_distance
+    out["best_interferer_azimuth_delta_deg"] = best_interferer_az_delta
+    out["interference_sum_proxy_dbm"] = interference_sum_dbm
+    out["interference_gap_db"] = interference_gap_db
+    out["interference_ratio_linear"] = interference_ratio
+    print(
+        f"[TEST][SINR_FIX] fixed_serving_rows={updated_rows} "
+        f"candidate_pool={candidate_k} total_rows={len(out)}"
+    )
+    return out
+
+
+def _resolve_validation_sessions(session_ids: Iterable[int]) -> Tuple[int, ...]:
+    session_ids = tuple(int(session_id) for session_id in session_ids)
+    if not session_ids:
+        raise ValueError("At least one DT session is required for validation.")
+    return session_ids
+
+
+def _prepare_drive_measurements(drive_df: pd.DataFrame) -> pd.DataFrame:
+    dt = drive_df.dropna(subset=["lat", "lon"]).copy()
+    rcol = next((c for c in dt.columns if "rsrp" in c.lower()), None)
+    qcol = next((c for c in dt.columns if "rsrq" in c.lower()), None)
+    scol = next((c for c in dt.columns if "sinr" in c.lower()), None)
+    if rcol is None:
+        raise ValueError("Drive-test data is missing an RSRP column")
+    dt["RSRP_meas"] = pd.to_numeric(dt[rcol], errors="coerce")
+    if qcol:
+        dt["RSRQ_meas"] = pd.to_numeric(dt[qcol], errors="coerce")
+    if scol:
+        dt["SINR_meas"] = pd.to_numeric(dt[scol], errors="coerce")
+    dt = dt.dropna(subset=["RSRP_meas"]).copy()
+    return dt
+
+
+def _attach_prediction_grid_to_points(points_df: pd.DataFrame, pred_df: pd.DataFrame) -> pd.DataFrame:
+    points = points_df.copy()
+    keep_cols = [
+        "lat",
+        "lon",
+        "pred_rsrp",
+        "pred_rsrq",
+        "pred_sinr",
+        "pred_rsrp_geo",
+        "pred_rsrq_geo",
+        "pred_sinr_geo",
+        "pred_rsrp_demo",
+        "pred_rsrq_demo",
+        "pred_sinr_demo",
+        "morphology_cluster",
+        "grid_id",
+        "clutter_class",
+    ]
+    pred_keep_cols = [col for col in keep_cols if col in pred_df.columns]
+    preds = pred_df[pred_keep_cols].dropna(subset=["lat", "lon"]).copy()
+    if points.empty or preds.empty:
+        print(
+            f"[TEST][GRID_MATCH] skipped points_empty={points.empty} preds_empty={preds.empty} "
+            f"point_rows={len(points)} pred_rows={len(preds)}"
+        )
+        return points
+
+    points_gdf = gpd.GeoDataFrame(
+        points,
+        geometry=gpd.points_from_xy(points["lon"], points["lat"]),
+        crs="EPSG:4326",
+    )
+    preds_gdf = gpd.GeoDataFrame(
+        preds,
+        geometry=gpd.points_from_xy(preds["lon"], preds["lat"]),
+        crs="EPSG:4326",
+    )
+    preds_gdf = preds_gdf.rename(columns={"lat": "grid_lat", "lon": "grid_lon"})
+    utm_crs = _choose_utm_crs(preds_gdf)
+    joined = gpd.sjoin_nearest(
+        points_gdf.to_crs(utm_crs),
+        preds_gdf.to_crs(utm_crs),
+        how="left",
+        distance_col="grid_match_distance_m",
+    )
+    joined = joined.to_crs("EPSG:4326")
+    joined = joined.drop(columns=["geometry", "index_right"], errors="ignore")
+    out = pd.DataFrame(joined)
+    expected_cols = ["pred_rsrp", "pred_rsrq", "pred_sinr", "morphology_cluster"]
+    missing_cols = [col for col in expected_cols if col not in out.columns]
+    if missing_cols:
+        print(
+            f"[TEST][GRID_MATCH] missing_prediction_columns={missing_cols} "
+            f"joined_columns={list(out.columns)}"
+        )
+    else:
+        print(
+            f"[TEST][GRID_MATCH] matched_points={len(out)} "
+            f"pred_rsrp_non_null={int(out['pred_rsrp'].notna().sum())} "
+            f"cluster_non_null={int(out['morphology_cluster'].notna().sum())}"
+        )
+    return out
+
+
+def _apply_demo_dt_overlay(
+    pred_df: pd.DataFrame,
+    drive_df: pd.DataFrame,
+    replace_radius_m: float = 20.0,
+    blend_sigma_m: float = 60.0,
+    blend_radius_m: float = 140.0,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    pred_out = pred_df.copy()
+    dt = _prepare_drive_measurements(drive_df)
+    required_pred_cols = {"lat", "lon"}
+    if pred_out.empty or dt.empty or not required_pred_cols.issubset(pred_out.columns):
+        return pred_out, {
+            "enabled": False,
+            "reason": "missing_prediction_or_dt_points",
+            "pred_rows": len(pred_out),
+            "dt_rows": len(dt),
+        }
+
+    pred_points = pred_out.dropna(subset=["lat", "lon"]).copy()
+    if pred_points.empty:
+        return pred_out, {
+            "enabled": False,
+            "reason": "prediction_coordinates_missing",
+            "pred_rows": len(pred_out),
+            "dt_rows": len(dt),
+        }
+
+    pred_gdf = gpd.GeoDataFrame(
+        pred_points,
+        geometry=gpd.points_from_xy(pred_points["lon"], pred_points["lat"]),
+        crs="EPSG:4326",
+    )
+    dt_gdf = gpd.GeoDataFrame(
+        dt,
+        geometry=gpd.points_from_xy(dt["lon"], dt["lat"]),
+        crs="EPSG:4326",
+    )
+    utm_crs = _choose_utm_crs(pred_gdf)
+    pred_utm = pred_gdf.to_crs(utm_crs)
+    dt_utm = dt_gdf.to_crs(utm_crs)
+
+    pred_coords = np.c_[pred_utm.geometry.x.to_numpy(dtype=float), pred_utm.geometry.y.to_numpy(dtype=float)]
+    dt_coords = np.c_[dt_utm.geometry.x.to_numpy(dtype=float), dt_utm.geometry.y.to_numpy(dtype=float)]
+    if len(pred_coords) == 0 or len(dt_coords) == 0:
+        return pred_out, {
+            "enabled": False,
+            "reason": "empty_metric_coordinate_frame",
+            "pred_rows": len(pred_out),
+            "dt_rows": len(dt),
+        }
+
+    dt_tree = BallTree(dt_coords, metric="euclidean")
+    pred_tree = BallTree(pred_coords, metric="euclidean")
+    nearest_dt_dist, nearest_dt_idx = dt_tree.query(pred_coords, k=1)
+    nearest_pred_dist, nearest_pred_idx = pred_tree.query(dt_coords, k=1)
+    nearest_dt_dist = nearest_dt_dist[:, 0]
+    nearest_dt_idx = nearest_dt_idx[:, 0]
+    nearest_pred_dist = nearest_pred_dist[:, 0]
+    nearest_pred_idx = nearest_pred_idx[:, 0]
+
+    pred_out["demo_dt_distance_m"] = np.nan
+    pred_out.loc[pred_points.index, "demo_dt_distance_m"] = nearest_dt_dist
+    pred_out["demo_blend_weight"] = 0.0
+    pred_out["demo_dt_anchor"] = False
+
+    kpi_specs = [
+        ("RSRP_meas", "pred_rsrp_geo" if "pred_rsrp_geo" in pred_out.columns else "pred_rsrp", "pred_rsrp_demo", -140.0, -44.0),
+        ("RSRQ_meas", "pred_rsrq_geo" if "pred_rsrq_geo" in pred_out.columns else "pred_rsrq", "pred_rsrq_demo", -20.0, -3.0),
+        ("SINR_meas", "pred_sinr_geo" if "pred_sinr_geo" in pred_out.columns else "pred_sinr", "pred_sinr_demo", -10.0, 30.0),
+    ]
+
+    blend_weight = np.exp(-0.5 * np.square(nearest_dt_dist / max(blend_sigma_m, 1.0)))
+    blend_weight = np.where(nearest_dt_dist <= blend_radius_m, blend_weight, 0.0)
+    blend_weight = np.clip(blend_weight, 0.0, 1.0)
+    anchor_mask = nearest_dt_dist <= replace_radius_m
+    blend_weight = np.where(anchor_mask, 1.0, blend_weight)
+    pred_out.loc[pred_points.index, "demo_blend_weight"] = blend_weight
+
+    anchor_hits = pd.Series(False, index=pred_points.index)
+    for dt_row_pos, pred_row_pos in enumerate(nearest_pred_idx):
+        if nearest_pred_dist[dt_row_pos] <= replace_radius_m:
+            anchor_hits.iloc[int(pred_row_pos)] = True
+
+    for meas_col, base_col, out_col, clip_min, clip_max in kpi_specs:
+        if base_col not in pred_out.columns:
+            continue
+        pred_out[out_col] = pd.to_numeric(pred_out[base_col], errors="coerce")
+        if meas_col not in dt.columns:
+            continue
+
+        dt_meas = pd.to_numeric(dt[meas_col], errors="coerce").to_numpy(dtype=float)
+        base_vals = pd.to_numeric(pred_points[base_col], errors="coerce").to_numpy(dtype=float)
+        nearest_vals = dt_meas[nearest_dt_idx]
+        blended_vals = ((1.0 - blend_weight) * base_vals) + (blend_weight * nearest_vals)
+        blended_vals = np.clip(blended_vals, clip_min, clip_max)
+        pred_out.loc[pred_points.index, out_col] = blended_vals
+
+        anchored_indices: List[int] = []
+        anchored_values: List[float] = []
+        for dt_row_pos, pred_row_pos in enumerate(nearest_pred_idx):
+            dt_value = dt_meas[dt_row_pos]
+            if np.isnan(dt_value) or nearest_pred_dist[dt_row_pos] > replace_radius_m:
+                continue
+            anchored_indices.append(int(pred_points.index[int(pred_row_pos)]))
+            anchored_values.append(float(np.clip(dt_value, clip_min, clip_max)))
+        if anchored_indices:
+            pred_out.loc[anchored_indices, out_col] = anchored_values
+
+    pred_out.loc[pred_points.index, "demo_dt_anchor"] = anchor_hits.to_numpy(dtype=bool)
+    pred_out["demo_visual_source"] = np.where(
+        pred_out["demo_dt_anchor"],
+        "dt_anchor",
+        np.where(pred_out["demo_blend_weight"] > 0.0, "dt_blend", "prediction_only"),
+    )
+
+    summary = {
+        "enabled": True,
+        "replace_radius_m": float(replace_radius_m),
+        "blend_sigma_m": float(blend_sigma_m),
+        "blend_radius_m": float(blend_radius_m),
+        "pred_rows": int(len(pred_out)),
+        "dt_rows": int(len(dt)),
+        "anchor_cells": int(pred_out["demo_dt_anchor"].sum()),
+        "blended_cells": int((pred_out["demo_blend_weight"] > 0.0).sum()),
+    }
+    print(
+        f"[TEST][DEMO_OVERLAY] anchor_cells={summary['anchor_cells']} "
+        f"blended_cells={summary['blended_cells']} replace_radius_m={replace_radius_m} "
+        f"blend_sigma_m={blend_sigma_m} blend_radius_m={blend_radius_m}"
+    )
+    return pred_out, summary
+
+
+def _evaluate_prediction_grid_against_holdout(
+    holdout_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    offsets_df: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    holdout = _prepare_drive_measurements(holdout_df)
+    holdout = _attach_prediction_grid_to_points(holdout, pred_df)
+
+    baseline_metrics = {}
+    metric_specs = [
+        ("RSRP_meas", "pred_rsrp"),
+        ("RSRQ_meas", "pred_rsrq"),
+        ("SINR_meas", "pred_sinr"),
+    ]
+    rename_map = {
+        "pred_rsrp": "RSRP_pred",
+        "pred_rsrq": "RSRQ_pred",
+        "pred_sinr": "SINR_pred",
+        "pred_rsrp_geo": "RSRP_pred_geo",
+        "pred_rsrq_geo": "RSRQ_pred_geo",
+        "pred_sinr_geo": "SINR_pred_geo",
+    }
+    for src_col, out_col in rename_map.items():
+        if src_col in holdout.columns and out_col not in holdout.columns:
+            holdout[out_col] = holdout[src_col]
+
+    for meas_col, base_col in metric_specs:
+        if meas_col in holdout.columns and base_col in holdout.columns:
+            valid = holdout.dropna(subset=[meas_col, base_col])
+            if not valid.empty:
+                baseline_metrics[meas_col] = _metric_bundle(valid[meas_col], valid[base_col], metric_key=meas_col)
+    experimental_metric_specs = [
+        ("RSRP_meas", "pred_rsrp_geo"),
+        ("RSRQ_meas", "pred_rsrq_geo"),
+        ("SINR_meas", "pred_sinr_geo"),
+    ]
+    experimental_metrics = {}
+    for meas_col, exp_col in experimental_metric_specs:
+        if meas_col in holdout.columns and exp_col in holdout.columns:
+            valid = holdout.dropna(subset=[meas_col, exp_col])
+            if not valid.empty:
+                experimental_metrics[meas_col] = _metric_bundle(valid[meas_col], valid[exp_col], metric_key=meas_col)
+    return holdout, baseline_metrics, experimental_metrics
+
+
+def _build_experimental_feature_frame(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    pred_col = {
+        "RSRP": "pred_rsrp",
+        "RSRQ": "pred_rsrq",
+        "SINR": "pred_sinr",
+    }[metric_name]
+    work = df.copy()
+    feature_cols = [
+        pred_col,
+        "building_count",
+        "building_area_ratio",
+        "avg_building_area_m2",
+        "road_length_m",
+        "green_ratio",
+        "water_ratio",
+        "grid_match_distance_m",
+        "serving_distance_m",
+        "azimuth_delta_deg",
+        "serving_proxy_rsrp_phys_dbm",
+        "best_interferer_proxy_phys_dbm",
+        "sinr_proxy_db",
+        "rsrq_proxy_db",
+        "effective_tx_height_m",
+        "best_interferer_distance_m",
+        "interference_gap_db",
+        "los_blocker_count",
+        "los_blocked_ratio",
+        "diffraction_proxy_db",
+        "terrain_elevation_m",
+        "terrain_slope_deg",
+        "terrain_relief_to_site_m",
+    ]
+    available_numeric = [col for col in feature_cols if col in work.columns]
+    available_categorical = [col for col in ["clutter_class", "morphology_cluster"] if col in work.columns]
+    if not available_numeric and not available_categorical:
+        return pd.DataFrame(index=work.index)
+
+    numeric = work[available_numeric].apply(pd.to_numeric, errors="coerce").fillna(0.0) if available_numeric else pd.DataFrame(index=work.index)
+    categorical = pd.get_dummies(work[available_categorical].fillna("missing").astype(str), prefix=available_categorical) if available_categorical else pd.DataFrame(index=work.index)
+    features = pd.concat([numeric, categorical], axis=1)
+    return features.replace([np.inf, -np.inf], 0).fillna(0.0)
+
+
+def _geo_offset_from_features(df: pd.DataFrame) -> pd.Series:
+    work = df.copy()
+    for col in [
+        "building_count",
+        "building_area_ratio",
+        "avg_building_area_m2",
+        "road_length_m",
+        "green_ratio",
+        "water_ratio",
+        "morphology_cluster",
+        "nearest_site_distance_m",
+        "mean_nearest3_site_distance_m",
+        "site_count_250m",
+        "site_count_500m",
+        "serving_distance_m",
+        "azimuth_delta_deg",
+        "best_interferer_distance_m",
+        "best_interferer_azimuth_delta_deg",
+        "serving_proxy_rsrp_dbm",
+        "best_interferer_proxy_rsrp_dbm",
+        "serving_proxy_rsrp_phys_dbm",
+        "best_interferer_proxy_phys_dbm",
+        "interference_gap_db",
+        "interference_ratio_linear",
+        "interference_sum_proxy_dbm",
+        "sinr_proxy_db",
+        "rsrq_proxy_db",
+        "effective_tx_height_m",
+        "los_blocker_count",
+        "los_blocked_length_m",
+        "los_blocked_ratio",
+        "mean_blocker_height_m",
+        "max_blocker_height_m",
+        "nlos_flag",
+        "diffraction_proxy_db",
+        "terrain_elevation_m",
+        "terrain_slope_deg",
+        "proxy_site_elevation_m",
+        "terrain_relief_to_site_m",
+    ]:
+        series = work[col] if col in work.columns else pd.Series(0.0, index=work.index, dtype=float)
+        work[col] = pd.to_numeric(series, errors="coerce").fillna(0.0)
+
+    clutter_penalty = pd.Series(0.0, index=work.index)
+    if "clutter_class" in work.columns:
+        clutter_penalty = work["clutter_class"].astype(str).map(
+            {
+                "Dense Urban": -4.5,
+                "Urban": -2.5,
+                "Suburban": -1.0,
+                "Vegetation": -1.8,
+                "Water": 1.0,
+                "Rural/Open": 0.8,
+            }
+        ).fillna(0.0)
+
+    cluster_center = work["morphology_cluster"].mean() if len(work) else 0.0
+    cluster_offset = (work["morphology_cluster"] - cluster_center) * -0.35
+    building_offset = (-9.0 * work["building_area_ratio"].clip(0, 0.8)) + (-0.08 * work["building_count"].clip(0, 30))
+    road_offset = -0.003 * work["road_length_m"].clip(0, 400)
+    green_water_offset = (-2.0 * work["green_ratio"].clip(0, 1.0)) + (1.2 * work["water_ratio"].clip(0, 1.0))
+    size_offset = -0.0008 * work["avg_building_area_m2"].clip(0, 3000)
+    site_density_offset = (0.15 * work["site_count_250m"].clip(0, 12)) + (0.08 * work["site_count_500m"].clip(0, 25))
+    serving_distance_offset = -0.0035 * work["serving_distance_m"].clip(0, 1200)
+    nearest_site_offset = -0.0015 * work["nearest_site_distance_m"].clip(0, 1000)
+    boresight_offset = -0.018 * (work["azimuth_delta_deg"].clip(0, 180) / 10.0) ** 1.2
+    isolation_offset = 0.0008 * work["mean_nearest3_site_distance_m"].clip(0, 1500)
+    dense_urban_far_penalty = np.where(
+        (work.get("clutter_class", pd.Series("", index=work.index)).astype(str) == "Dense Urban")
+        & (work["nearest_site_distance_m"] > 180.0),
+        -2.8 - 0.004 * (work["nearest_site_distance_m"].clip(180.0, 700.0) - 180.0),
+        0.0,
+    )
+    urban_off_axis_penalty = np.where(
+        work["azimuth_delta_deg"] > 45.0,
+        -0.015 * (work["azimuth_delta_deg"].clip(45.0, 180.0) - 45.0),
+        0.0,
+    )
+    far_serving_off_axis_penalty = np.where(
+        (work["serving_distance_m"] > 250.0) & (work["azimuth_delta_deg"] > 35.0),
+        -1.2
+        - 0.004 * (work["serving_distance_m"].clip(250.0, 1200.0) - 250.0)
+        - 0.010 * (work["azimuth_delta_deg"].clip(35.0, 180.0) - 35.0),
+        0.0,
+    )
+    high_building_far_penalty = np.where(
+        (work["avg_building_area_m2"] > 250.0) & (work["nearest_site_distance_m"] > 160.0),
+        -1.1
+        - 0.0012 * (work["avg_building_area_m2"].clip(250.0, 3000.0) - 250.0)
+        - 0.0030 * (work["nearest_site_distance_m"].clip(160.0, 1000.0) - 160.0),
+        0.0,
+    )
+    vegetation_far_penalty = np.where(
+        (work.get("clutter_class", pd.Series("", index=work.index)).astype(str) == "Vegetation")
+        & (work["serving_distance_m"] > 220.0),
+        -0.8 - 2.2 * work["green_ratio"].clip(0.2, 1.0),
+        0.0,
+    )
+    water_open_bonus = np.where(
+        (
+            work.get("clutter_class", pd.Series("", index=work.index)).astype(str).isin(["Water", "Rural/Open"])
+            & (work["azimuth_delta_deg"] < 20.0)
+            & (work["nearest_site_distance_m"] < 220.0)
+        ),
+        0.9 + 0.0015 * (220.0 - work["nearest_site_distance_m"].clip(0.0, 220.0)),
+        0.0,
+    )
+    dense_site_bonus = np.where(
+        (work["site_count_250m"] >= 4.0) & (work["nearest_site_distance_m"] < 120.0),
+        0.7 + 0.06 * work["site_count_250m"].clip(4.0, 12.0),
+        0.0,
+    )
+    cluster_dense_urban_penalty = np.where(
+        (work["morphology_cluster"] >= (cluster_center + 1.0))
+        & (work.get("clutter_class", pd.Series("", index=work.index)).astype(str) == "Dense Urban"),
+        -1.4 - 0.35 * (work["morphology_cluster"] - cluster_center).clip(lower=0.0, upper=4.0),
+        0.0,
+    )
+    nlos_penalty = -2.4 * work["nlos_flag"].clip(0, 1)
+    blocker_penalty = (
+        -0.9 * work["los_blocker_count"].clip(0, 10)
+        - 5.5 * work["los_blocked_ratio"].clip(0, 1.0)
+        - 0.05 * work["max_blocker_height_m"].clip(0, 80.0)
+    )
+    diffraction_penalty = -0.55 * work["diffraction_proxy_db"].clip(0, 25.0)
+    terrain_penalty = (
+        -0.08 * work["terrain_slope_deg"].clip(0, 35.0)
+        - 0.028 * work["terrain_relief_to_site_m"].clip(lower=0.0, upper=180.0)
+    )
+    interference_penalty = np.where(
+        work["interference_gap_db"] < 6.0,
+        -0.55 * (6.0 - work["interference_gap_db"].clip(-15.0, 6.0)),
+        0.10 * (work["interference_gap_db"].clip(6.0, 18.0) - 6.0),
+    )
+    interference_ratio_penalty = -1.6 * work["interference_ratio_linear"].clip(0.0, 2.5)
+    return (
+        clutter_penalty
+        + cluster_offset
+        + building_offset
+        + road_offset
+        + green_water_offset
+        + size_offset
+        + site_density_offset
+        + serving_distance_offset
+        + nearest_site_offset
+        + boresight_offset
+        + isolation_offset
+        + pd.Series(dense_urban_far_penalty, index=work.index, dtype=float)
+        + pd.Series(urban_off_axis_penalty, index=work.index, dtype=float)
+        + pd.Series(far_serving_off_axis_penalty, index=work.index, dtype=float)
+        + pd.Series(high_building_far_penalty, index=work.index, dtype=float)
+        + pd.Series(vegetation_far_penalty, index=work.index, dtype=float)
+        + pd.Series(water_open_bonus, index=work.index, dtype=float)
+        + pd.Series(dense_site_bonus, index=work.index, dtype=float)
+        + pd.Series(cluster_dense_urban_penalty, index=work.index, dtype=float)
+        + nlos_penalty
+        + blocker_penalty
+        + diffraction_penalty
+        + pd.Series(terrain_penalty, index=work.index, dtype=float)
+        + pd.Series(interference_penalty, index=work.index, dtype=float)
+        + interference_ratio_penalty
+    )
+
+
+def _apply_experimental_geo_adjustments(pred_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Dict[str, object]]]:
+    pred_out = pred_df.copy()
+    geo_offset = _geo_offset_from_features(pred_out)
+    rsrp_base = pd.to_numeric(pred_out["pred_rsrp"], errors="coerce")
+    rsrq_base = pd.to_numeric(pred_out["pred_rsrq"], errors="coerce")
+    sinr_base = pd.to_numeric(pred_out["pred_sinr"], errors="coerce")
+    rsrp_phys = pd.to_numeric(pred_out.get("serving_proxy_rsrp_phys_dbm"), errors="coerce")
+    rsrq_phys = pd.to_numeric(pred_out.get("rsrq_proxy_db"), errors="coerce")
+    sinr_phys = pd.to_numeric(pred_out.get("sinr_proxy_db"), errors="coerce")
+
+    pred_out["pred_rsrp_geo"] = rsrp_base.copy()
+    has_rsrp_phys = rsrp_phys.notna()
+    pred_out.loc[has_rsrp_phys, "pred_rsrp_geo"] = (
+        (0.72 * rsrp_base[has_rsrp_phys])
+        + (0.28 * rsrp_phys[has_rsrp_phys])
+        + (0.55 * geo_offset[has_rsrp_phys])
+    )
+    pred_out.loc[~has_rsrp_phys, "pred_rsrp_geo"] = rsrp_base[~has_rsrp_phys] + geo_offset[~has_rsrp_phys]
+
+    pred_out["pred_rsrq_geo"] = rsrq_base.copy()
+    has_rsrq_phys = rsrq_phys.notna()
+    pred_out.loc[has_rsrq_phys, "pred_rsrq_geo"] = (
+        (0.76 * rsrq_base[has_rsrq_phys])
+        + (0.24 * rsrq_phys[has_rsrq_phys])
+        + (0.18 * geo_offset[has_rsrq_phys])
+    )
+    pred_out.loc[~has_rsrq_phys, "pred_rsrq_geo"] = rsrq_base[~has_rsrq_phys] + (geo_offset[~has_rsrq_phys] * 0.22)
+
+    pred_out["pred_sinr_geo"] = sinr_base.copy()
+    has_sinr_phys = sinr_phys.notna()
+    pred_out.loc[has_sinr_phys, "pred_sinr_geo"] = (
+        (0.68 * sinr_base[has_sinr_phys])
+        + (0.32 * sinr_phys[has_sinr_phys])
+        + (0.24 * geo_offset[has_sinr_phys])
+    )
+    pred_out.loc[~has_sinr_phys, "pred_sinr_geo"] = sinr_base[~has_sinr_phys] + (geo_offset[~has_sinr_phys] * 0.35)
+
+    pred_out["pred_rsrp_geo"] = pred_out["pred_rsrp_geo"].clip(-140, -44)
+    pred_out["pred_rsrq_geo"] = pred_out["pred_rsrq_geo"].clip(-20, -3)
+    pred_out["pred_sinr_geo"] = pred_out["pred_sinr_geo"].clip(-10, 30)
+
+    summary = {
+        "mode": {
+            "train_rows": 0,
+            "feature_count": 33,
+            "top_features": {
+                "blend_rsrp": "0.72 * baseline + 0.28 * forward_proxy_physics + 0.55 * geo_offset",
+                "blend_rsrq": "0.76 * baseline + 0.24 * rsrq_proxy_db + 0.18 * geo_offset",
+                "blend_sinr": "0.68 * baseline + 0.32 * sinr_proxy_db + 0.24 * geo_offset",
+                "building_area_ratio": -9.0,
+                "clutter_class": -4.5,
+                "serving_distance_m": -0.0035,
+                "azimuth_delta_deg": -0.018,
+                "site_count_250m": 0.15,
+                "green_ratio": -2.0,
+                "water_ratio": 1.2,
+                "morphology_cluster": -0.35,
+                "dense_urban_far_penalty": "if Dense Urban and nearest_site_distance_m > 180",
+                "far_serving_off_axis_penalty": "if serving_distance_m > 250 and azimuth_delta_deg > 35",
+                "high_building_far_penalty": "if avg_building_area_m2 > 250 and nearest_site_distance_m > 160",
+                "water_open_bonus": "if Water/Rural/Open and azimuth_delta_deg < 20 and nearest_site_distance_m < 220",
+                "nlos_flag": -2.4,
+                "los_blocked_ratio": -5.5,
+                "diffraction_proxy_db": -0.55,
+                "terrain_slope_deg": -0.08,
+                "terrain_relief_to_site_m": -0.028,
+                "interference_gap_db": "penalize below 6 dB, reward above 6 dB",
+                "dt_training_used": False,
+            },
+        }
+    }
+    print("[TEST][EXPERIMENTAL] mode=forward_proxy_blend_plus_geo_nonlinear dt_training_used=False")
+    return pred_out, summary
+
+
+def _run_rf_prediction_without_dt_calibration(
+    site_df: pd.DataFrame,
+    building_df: pd.DataFrame,
+    params: Dict[str, object],
+) -> pd.DataFrame:
+    temp_dir = "temp_rf"
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
+
+    site_path = f"{temp_dir}/site.csv"
+    building_path = f"{temp_dir}/building.csv"
+    site_export_df = _prepare_site_df_for_source_rf_export(site_df)
+    site_export_df.to_csv(site_path, index=False)
+    building_df.to_csv(building_path, index=False)
+
+    print(
+        f"[TEST][RF_BASELINE] mode=cost231_no_dt_calibration site_rows={len(site_export_df)} "
+        f"building_rows={len(building_df)} radius={params['radius']} grid={params['grid']}"
+    )
+    run_prediction_from_api({
+        "site": site_path,
+        "drive": None,
+        "building": building_path,
+        "polygon_area": None,
+        "radius": params["radius"],
+        "grid_resolution": params["grid"],
+        "frequency": params.get("frequency_mhz", 1800),
+        "bandwidth": params.get("bandwidth_mhz", 10),
+        "antenna_gain": params.get("antenna_gain", 18),
+        "cable_loss": params.get("cable_loss", 2),
+        "ue_height": params.get("ue_height", 1.5),
+        "outdir": temp_dir,
+        "n_workers": params["workers"],
+        "max_interference_sites": params.get("max_interference_sites", 50),
+        "calibrate": False,
+    })
+
+    pred_df = pd.read_csv(f"{temp_dir}/prediction_ALL_SITES.csv")
+    current_engine = ml_engine.engine.get(params.get("region", "india").lower(), ml_engine.engine["india"])
+    pred_df, polygon_stats = ml_engine._apply_prediction_polygon_filter(
+        pred_df, params["project_id"], current_engine
+    )
+    print(
+        f"[LTE][RF_OUTPUT_COUNTS] rows_before_polygon={polygon_stats['rows_before']} "
+        f"rows_after_polygon={len(pred_df)} "
+        f"polygon_removed={polygon_stats['rows_before'] - len(pred_df)} "
+        f"polygon_swapped={polygon_stats['swapped']}"
+    )
+    ml_engine._print_fetch_summary(
+        "RF_OUTPUT",
+        "temp_rf/prediction_ALL_SITES.csv",
+        {
+            "radius": params["radius"],
+            "grid": params["grid"],
+            "project_id": params["project_id"],
+            "region": params.get("region", "india"),
+            "calibrate": False,
+        },
+        pred_df,
+        extra={
+            "unique_predicted_cells": ml_engine._safe_nunique(pred_df, "Node_Cell_ID"),
+            "pred_rsrp_range": ml_engine._safe_minmax(pred_df, "pred_rsrp"),
+            "pred_rsrq_range": ml_engine._safe_minmax(pred_df, "pred_rsrq"),
+            "pred_sinr_range": ml_engine._safe_minmax(pred_df, "pred_sinr"),
+        }
+    )
+    return pred_df
+
+
+def _build_rf_accuracy_frame(
+    site_df: pd.DataFrame,
+    drive_df: pd.DataFrame,
+    building_polygons,
+    building_meta,
+    workers: int,
+    max_interference_sites: int,
+) -> pd.DataFrame:
+    site_rf = _normalize_site_for_rf(site_df)
+    dt = drive_df.dropna(subset=["lat", "lon"]).copy()
+    rcol = next((c for c in dt.columns if "rsrp" in c.lower()), None)
+    qcol = next((c for c in dt.columns if "rsrq" in c.lower()), None)
+    scol = next((c for c in dt.columns if "sinr" in c.lower()), None)
+    if rcol is None:
+        raise ValueError("Drive-test data is missing an RSRP column")
+
+    dt["RSRP_meas"] = pd.to_numeric(dt[rcol], errors="coerce")
+    if qcol:
+        dt["RSRQ_meas"] = pd.to_numeric(dt[qcol], errors="coerce")
+    if scol:
+        dt["SINR_meas"] = pd.to_numeric(dt[scol], errors="coerce")
+    dt = dt.dropna(subset=["RSRP_meas"])
+
+    params = {
+        "k1": 0,
+        "k2": 0,
+        "polygons": building_polygons,
+        "meta": building_meta,
+        "antenna_gain": 18,
+        "cable_loss": 2,
+        "ue_height": 1.5,
+        "frequency_mhz": 1800,
+        "bandwidth_mhz": 10,
+        "all_sites_rows": select_nearest_site_rows(site_rf, site_rf, max_interference_sites),
+        "n_workers": workers,
+    }
+
+    rsrp_pred, rsrq_pred, sinr_pred = compute_predictions_parallel(
+        dt,
+        site_rf,
+        params,
+        n_workers=workers,
+        use_shared_pool=True,
+    )
+    dt["RSRP_pred"] = rsrp_pred
+    dt["RSRQ_pred"] = rsrq_pred
+    dt["SINR_pred"] = sinr_pred
+    return dt
+
+
+
+
+def _find_latest_rf_log(before: Iterable[Path], after: Iterable[Path]) -> Optional[Path]:
+    before_set = {p.resolve() for p in before}
+    new_logs = [p for p in after if p.resolve() not in before_set]
+    if not new_logs:
+        return None
+    return max(new_logs, key=lambda p: p.stat().st_mtime)
+
+
+def _collect_rf_logs() -> List[Path]:
+    root = Path("temp_rf")
+    if not root.exists():
+        return []
+    return sorted(root.glob("run_log_*.txt"))
+
+
+def run_rf_debug_lab(config: RunConfig) -> Path:
+    run_dir = _ensure_dir(config.output_root / f"project_{config.project_id}" / _timestamp())
+    cache_dir = _ensure_dir(run_dir / "cache")
+    shared_cache_dir = _project_shared_cache_dir(config.output_root, config.project_id)
+    log_path = run_dir / "run.log"
+    timings: Dict[str, float] = {}
+    summary: Dict[str, object] = {"config": config.__dict__.copy(), "run_dir": str(run_dir)}
+    cached_artifacts = _load_cached_run_artifacts(config.reuse_run_dir) if config.reuse_cached_artifacts else {}
+    cached_summary = cached_artifacts.get("summary") if cached_artifacts else None
+    cache_reuse: Dict[str, object] = {
+        "enabled": bool(config.reuse_cached_artifacts),
+        "base_dir": str(cached_artifacts.get("base_dir")) if cached_artifacts else None,
+        "inputs": False,
+        "rf_prediction": False,
+        "geo_enrichment": False,
+        "advanced_geo_append": False,
+        "reasons": {},
+    }
+    summary["cache_reuse"] = cache_reuse
+
+    with log_path.open("w", encoding="utf-8") as log_file:
+        tee = TeeStream(sys.stdout, log_file)
+        with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            print(f"[TEST] Starting RF debug lab for project_id={config.project_id}")
+            start_all = time.perf_counter()
+
+            step = time.perf_counter()
+            input_match, input_mismatches = _cached_config_matches(
+                config,
+                cached_summary,
+                ["project_id", "session_ids", "region"],
+            )
+            can_reuse_inputs = (
+                input_match
+                and isinstance(cached_artifacts.get("site_df"), pd.DataFrame)
+                and isinstance(cached_artifacts.get("drive_df"), pd.DataFrame)
+                and isinstance(cached_artifacts.get("building_df"), pd.DataFrame)
+                and isinstance(cached_artifacts.get("polygon_gdf"), gpd.GeoDataFrame)
+            )
+            if can_reuse_inputs:
+                site_df = _normalize_site_for_rf(cached_artifacts["site_df"])
+                drive_df = cached_artifacts["drive_df"].copy()
+                building_df = cached_artifacts["building_df"].copy()
+                polygon_gdf = cached_artifacts["polygon_gdf"].copy()
+                operator = str((cached_summary or {}).get("operator") or "cached")
+                polygon_alignment = str((cached_summary or {}).get("project_polygon_alignment") or "cached")
+                cache_reuse["inputs"] = True
+                print(f"[TEST][CACHE] Reusing saved input artifacts from {cached_artifacts['base_dir']}")
+            else:
+                cache_reuse["reasons"]["inputs"] = input_mismatches or ["artifacts_missing"]
+                site_df, operator = ml_engine.fetch_site_data(config.project_id, region=config.region)
+                site_df = _normalize_site_for_rf(site_df)
+                drive_df = _fetch_drive_data_for_test(
+                    config.session_ids,
+                    operator,
+                    config.project_id,
+                    region=config.region,
+                )
+                building_df = _fetch_building_data_for_test(config.project_id, config.region)
+                polygon_gdf = _load_project_polygon_gdf(config.project_id, config.region)
+                polygon_gdf, polygon_alignment = _align_project_polygon_to_points(polygon_gdf, site_df)
+            timings["fetch_inputs_sec"] = round(time.perf_counter() - step, 2)
+            validation_sessions = _resolve_validation_sessions(config.session_ids)
+            print(
+                f"[TEST] Inputs fetched site_rows={len(site_df)} drive_rows={len(drive_df)} "
+                f"building_rows={len(building_df)} operator={operator}"
+            )
+            print(f"[TEST] Project polygon alignment={polygon_alignment}")
+            print(
+                f"[TEST] Validation mode=dt_validation_only "
+                f"validation_sessions={list(validation_sessions)} validation_rows={len(drive_df)}"
+            )
+
+            step = time.perf_counter()
+            cached_building_gdf = cached_artifacts.get("building_gdf")
+            if cache_reuse["inputs"] and isinstance(cached_building_gdf, gpd.GeoDataFrame):
+                building_gdf = cached_building_gdf.copy()
+                building_alignment = str((cached_summary or {}).get("building_alignment") or "cached")
+            else:
+                building_gdf = _building_df_to_gdf(building_df)
+                building_gdf, building_alignment = _align_building_geometries_to_project(building_gdf, polygon_gdf)
+            building_df_for_rf = _prepare_building_df_for_rf(building_df, building_gdf)
+            building_csv = run_dir / "building_debug.csv"
+            export_building_df = building_df_for_rf.copy()
+            export_building_df.to_csv(building_csv, index=False)
+            building_polygons, building_meta = load_building_polygons(str(building_csv))
+            timings["parse_buildings_sec"] = round(time.perf_counter() - step, 2)
+            print(
+                f"[TEST] Building geometry parsed db_polygons={len(building_gdf)} "
+                f"rf_polygons={len(building_polygons)}"
+            )
+            if not building_gdf.empty:
+                print(f"[TEST] Building bounds={building_gdf.total_bounds.tolist()}")
+                print(f"[TEST] Building alignment={building_alignment}")
+                print(
+                    f"[TEST] RF building export prepared rows={len(building_df_for_rf)} "
+                    f"non_null_geometry_wkt={int(building_df_for_rf['geometry_wkt'].notna().sum())}"
+                )
+            else:
+                print("[TEST] Building geometry still empty after parsing; geo building features will remain zero")
+
+            step = time.perf_counter()
+            pred_match, pred_mismatches = _cached_config_matches(
+                config,
+                cached_summary,
+                ["project_id", "region", "radius_m", "grid_resolution_m", "max_interference_sites"],
+            )
+            cached_pred_ok, cached_pred_issues = _cached_prediction_is_usable(cached_artifacts.get("pred_df"))
+            if pred_match and cached_pred_ok:
+                pred_df = cached_artifacts["pred_df"].copy()
+                cache_reuse["rf_prediction"] = True
+                print(f"[TEST][CACHE] Reusing saved RF prediction grid from {cached_artifacts['base_dir']}")
+            else:
+                cache_reuse["reasons"]["rf_prediction"] = pred_mismatches or cached_pred_issues
+                pre_logs = _collect_rf_logs()
+                pred_df = _run_rf_prediction_without_dt_calibration(
+                    site_df,
+                    building_df_for_rf,
+                    {
+                        "project_id": config.project_id,
+                        "region": config.region,
+                        "radius": config.radius_m,
+                        "grid": config.grid_resolution_m,
+                        "workers": config.workers,
+                        "max_interference_sites": config.max_interference_sites,
+                    },
+                )
+                post_logs = _collect_rf_logs()
+                rf_log_path = _find_latest_rf_log(pre_logs, post_logs)
+                if rf_log_path:
+                    rf_log_copy = run_dir / rf_log_path.name
+                    rf_log_copy.write_text(rf_log_path.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+                    summary["rf_log_path"] = str(rf_log_copy)
+                    print(f"[TEST] RF source log captured at {rf_log_copy}")
+            timings["rf_prediction_sec"] = round(time.perf_counter() - step, 2)
+            rf_log_path = cached_artifacts.get("rf_log_path") if cache_reuse["rf_prediction"] else None
+            if rf_log_path:
+                rf_log_copy = run_dir / rf_log_path.name
+                rf_log_copy.write_text(rf_log_path.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+                summary["rf_log_path"] = str(rf_log_copy)
+                print(f"[TEST] RF source log copied from cached run to {rf_log_copy}")
+
+            step = time.perf_counter()
+            geo_match, geo_mismatches = _cached_config_matches(
+                config,
+                cached_summary,
+                ["project_id", "region", "tile_size_m", "cluster_count", "enable_osm"],
+            )
+            cached_grid_ok, cached_grid_issues = _cached_grid_artifacts_are_usable(
+                cached_artifacts.get("grid_gdf"),
+                cached_artifacts.get("grid_df"),
+            )
+            if geo_match and cached_grid_ok:
+                grid_gdf = cached_artifacts["grid_gdf"].copy()
+                grid_df = cached_artifacts["grid_df"].copy()
+                feature_stats = dict((cached_summary or {}).get("feature_diagnostics") or _feature_diagnostics(grid_df))
+                osm_status = dict((cached_summary or {}).get("osm_status") or {
+                    "enabled": config.enable_osm,
+                    "roads": False,
+                    "green": False,
+                    "water": False,
+                })
+                if "clutter_class" not in grid_gdf.columns or "morphology_cluster" not in grid_gdf.columns:
+                    grid_gdf = grid_gdf.merge(
+                        grid_df[["grid_id", "clutter_class", "morphology_cluster"]],
+                        on="grid_id",
+                        how="left",
+                    )
+                cache_reuse["geo_enrichment"] = True
+                print(f"[TEST][CACHE] Reusing saved geo-enriched grid from {cached_artifacts['base_dir']}")
+            else:
+                cache_reuse["reasons"]["geo_enrichment"] = geo_mismatches or cached_grid_issues
+                grid_gdf = _create_analysis_grid(polygon_gdf, config.tile_size_m)
+                grid_gdf = _attach_building_features(grid_gdf, building_gdf)
+                grid_gdf["road_length_m"] = 0.0
+                grid_gdf["green_ratio"] = 0.0
+                grid_gdf["water_ratio"] = 0.0
+
+                osm_status = {"enabled": config.enable_osm, "roads": False, "green": False, "water": False}
+                if config.enable_osm:
+                    roads_gdf = _fetch_osm_layer("roads", polygon_gdf, ROAD_TAGS, cache_dir)
+                    green_gdf = _fetch_osm_layer("green", polygon_gdf, GREEN_TAGS, cache_dir)
+                    water_gdf = _fetch_osm_layer("water", polygon_gdf, WATER_TAGS, cache_dir)
+                    osm_status["roads"] = not roads_gdf.empty
+                    osm_status["green"] = not green_gdf.empty
+                    osm_status["water"] = not water_gdf.empty
+                    grid_gdf = _attach_line_density(grid_gdf, roads_gdf, "road_length_m")
+                    grid_gdf = _attach_polygon_area_ratio(grid_gdf, green_gdf, "green_ratio")
+                    grid_gdf = _attach_polygon_area_ratio(grid_gdf, water_gdf, "water_ratio")
+                grid_df, _, feature_stats = _build_grid_feature_frame(
+                    grid_gdf,
+                    site_df,
+                    config.cluster_count,
+                )
+                grid_gdf = grid_gdf.merge(
+                    grid_df[["grid_id", "clutter_class", "morphology_cluster"]],
+                    on="grid_id",
+                    how="left",
+                )
+            advanced_geo_before = set(grid_df.columns)
+            grid_df, advanced_geo_status = _augment_grid_with_advanced_geo_features(
+                grid_df,
+                building_gdf,
+                site_df,
+                polygon_gdf,
+                shared_cache_dir,
+                project_id=config.project_id,
+                dem_raster_path=config.dem_raster_path,
+                terrain_api_url=config.terrain_api_url,
+                terrain_api_batch_size=config.terrain_api_batch_size,
+                terrain_sample_step_m=config.terrain_sample_step_m,
+            )
+            new_advanced_cols = sorted(set(grid_df.columns) - advanced_geo_before)
+            cache_reuse["advanced_geo_append"] = bool(new_advanced_cols)
+            if new_advanced_cols:
+                print(f"[TEST][CACHE] Appended advanced geo features columns={new_advanced_cols}")
+            _validate_advanced_geo_requirements(
+                grid_df,
+                advanced_geo_status,
+                require_advanced_geo_on_miss=config.require_advanced_geo_on_miss,
+            )
+            for feature_name, stats in feature_stats.items():
+                print(
+                    f"[TEST][FEATURE] {feature_name} non_zero={stats['non_zero']} "
+                    f"nunique={stats['nunique']} min={stats['min']:.4f} "
+                    f"max={stats['max']:.4f} mean={stats['mean']:.4f}"
+                )
+            advanced_feature_stats = _feature_diagnostics(grid_df)
+            for feature_name in [
+                "best_interferer_distance_m",
+                "interference_gap_db",
+                "los_blocker_count",
+                "los_blocked_ratio",
+                "diffraction_proxy_db",
+                "terrain_elevation_m",
+                "terrain_slope_deg",
+                "terrain_relief_to_site_m",
+            ]:
+                stats = advanced_feature_stats.get(feature_name)
+                if stats:
+                    print(
+                        f"[TEST][FEATURE_ADV] {feature_name} non_zero={stats['non_zero']} "
+                        f"nunique={stats['nunique']} min={stats['min']:.4f} "
+                        f"max={stats['max']:.4f} mean={stats['mean']:.4f}"
+                    )
+            timings["geo_enrichment_sec"] = round(time.perf_counter() - step, 2)
+            summary["osm_status"] = osm_status
+            summary["advanced_geo_status"] = advanced_geo_status
+            summary["project_polygon_alignment"] = polygon_alignment
+            summary["building_alignment"] = building_alignment
+            summary["feature_diagnostics"] = advanced_feature_stats
+            summary["holdout_strategy"] = "validation_only_sessions"
+            summary["train_sessions"] = []
+            summary["holdout_sessions"] = list(validation_sessions)
+            summary["cluster_counts"] = (
+                grid_df["morphology_cluster"].value_counts(dropna=False).sort_index().to_dict()
+                if "morphology_cluster" in grid_df.columns
+                else {}
+            )
+            print(f"[TEST][CLUSTER] counts={summary['cluster_counts']}")
+            _run_post_rf_smoke_test(pred_df, drive_df, grid_gdf, grid_df)
+
+            step = time.perf_counter()
+            pred_df = _assign_points_to_tiles(pred_df, grid_gdf)
+            pred_df = _attach_missing_grid_features_by_grid_id(pred_df, grid_df)
+            pred_df = _attach_fixed_serving_sinr_rsrq_proxy(pred_df, site_df)
+            pred_df, experimental_model_debug = _apply_experimental_geo_adjustments(pred_df)
+            holdout_eval, baseline_metrics, experimental_metrics = _evaluate_prediction_grid_against_holdout(
+                drive_df,
+                pred_df,
+            )
+            pred_df, demo_overlay_summary = _apply_demo_dt_overlay(pred_df, drive_df)
+            _run_post_rf_integrity_checks(pred_df, grid_gdf, grid_df, holdout_eval)
+            _run_artifact_write_smoke(run_dir, pred_df, holdout_eval, grid_df)
+            metrics = {
+                "baseline": baseline_metrics,
+                "experimental": experimental_metrics,
+            }
+            timings["evaluation_sec"] = round(time.perf_counter() - step, 2)
+            summary["production_style_prediction"] = True
+            summary["experimental_model"] = experimental_model_debug
+            summary["demo_visualization"] = demo_overlay_summary
+
+            step = time.perf_counter()
+            grid_gdf.to_file(run_dir / "analysis_grid.geojson", driver="GeoJSON")
+            if not building_gdf.empty:
+                building_gdf.to_file(run_dir / "buildings.geojson", driver="GeoJSON")
+            polygon_gdf.to_file(run_dir / "project_polygon.geojson", driver="GeoJSON")
+            grid_df.to_csv(run_dir / "analysis_grid_features.csv", index=False)
+            site_df.to_csv(run_dir / "site_df.csv", index=False)
+            drive_df.to_csv(run_dir / "drive_df.csv", index=False)
+            pd.DataFrame().to_csv(run_dir / "drive_train.csv", index=False)
+            drive_df.to_csv(run_dir / "drive_holdout.csv", index=False)
+            holdout_eval.to_csv(run_dir / "rf_accuracy_points.csv", index=False)
+            pred_df.to_parquet(run_dir / "rf_prediction_grid.parquet", index=False)
+            _safe_sample(pred_df).to_csv(run_dir / "rf_prediction_grid_sample.csv", index=False)
+            timings["artifact_write_sec"] = round(time.perf_counter() - step, 2)
+
+            summary.update(
+                {
+                    "operator": operator,
+                    "rows": {
+                        "site_df": len(site_df),
+                        "drive_df": len(drive_df),
+                        "building_df": len(building_df),
+                        "building_polygons": len(building_polygons),
+                        "analysis_grid": len(grid_gdf),
+                        "rf_prediction_grid": len(pred_df),
+                        "rf_accuracy_points": len(holdout_eval),
+                        "drive_train_df": 0,
+                        "drive_holdout_df": len(drive_df),
+                    },
+                    "timings_sec": timings,
+                    "validation_metrics": metrics,
+                    "full_metrics": {
+                        "baseline": baseline_metrics,
+                        "experimental": experimental_metrics,
+                    },
+                    "artifacts": {
+                        "analysis_grid": str(run_dir / "analysis_grid.geojson"),
+                        "analysis_grid_features": str(run_dir / "analysis_grid_features.csv"),
+                        "buildings": str(run_dir / "buildings.geojson"),
+                        "project_polygon": str(run_dir / "project_polygon.geojson"),
+                        "rf_accuracy_points": str(run_dir / "rf_accuracy_points.csv"),
+                        "rf_prediction_grid": str(run_dir / "rf_prediction_grid.parquet"),
+                        "rf_prediction_grid_sample": str(run_dir / "rf_prediction_grid_sample.csv"),
+                        "site_df": str(run_dir / "site_df.csv"),
+                        "drive_df": str(run_dir / "drive_df.csv"),
+                        "drive_train": str(run_dir / "drive_train.csv"),
+                        "drive_holdout": str(run_dir / "drive_holdout.csv"),
+                        "run_log": str(log_path),
+                    },
+                }
+            )
+            summary["total_runtime_sec"] = round(time.perf_counter() - start_all, 2)
+            _write_json(run_dir / "summary.json", summary)
+            print(f"[TEST] Completed run in {summary['total_runtime_sec']} sec")
+
+    return run_dir
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Test-only LTE RF debug lab for project 196")
+    parser.add_argument("--project-id", type=int, default=DEFAULT_PROJECT_ID)
+    parser.add_argument("--session-ids", type=int, nargs="+", default=DEFAULT_SESSION_IDS)
+    parser.add_argument("--region", type=str, default=DEFAULT_REGION)
+    parser.add_argument("--radius-m", type=float, default=DEFAULT_RADIUS_M)
+    parser.add_argument("--grid-resolution-m", type=float, default=DEFAULT_GRID_RESOLUTION_M)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--max-interference-sites", type=int, default=DEFAULT_MAX_INTERFERENCE_SITES)
+    parser.add_argument("--tile-size-m", type=float, default=DEFAULT_TILE_SIZE_M)
+    parser.add_argument("--cluster-count", type=int, default=DEFAULT_CLUSTER_COUNT)
+    parser.add_argument("--validation-fraction", type=float, default=DEFAULT_VALIDATION_FRACTION)
+    parser.add_argument("--enable-osm", action="store_true")
+    parser.add_argument("--dem-raster-path", type=Path, default=DEFAULT_DEM_RASTER_PATH)
+    parser.add_argument("--allow-missing-advanced-geo", action="store_true")
+    parser.add_argument("--terrain-api-url", type=str, default=DEFAULT_TERRAIN_API_URL)
+    parser.add_argument("--terrain-api-batch-size", type=int, default=DEFAULT_TERRAIN_API_BATCH_SIZE)
+    parser.add_argument("--terrain-sample-step-m", type=float, default=DEFAULT_TERRAIN_SAMPLE_STEP_M)
+    parser.add_argument("--output-root", type=Path, default=Path("tests/output"))
+    parser.add_argument("--reuse-run-dir", type=Path, default=DEFAULT_REUSE_RUN_DIR)
+    parser.add_argument("--disable-reuse-cache", action="store_true")
+    args = parser.parse_args(argv)
+
+    config = RunConfig(
+        project_id=args.project_id,
+        session_ids=tuple(args.session_ids),
+        region=args.region,
+        radius_m=args.radius_m,
+        grid_resolution_m=args.grid_resolution_m,
+        workers=args.workers,
+        max_interference_sites=args.max_interference_sites,
+        tile_size_m=args.tile_size_m,
+        cluster_count=args.cluster_count,
+        validation_fraction=args.validation_fraction,
+        enable_osm=args.enable_osm,
+        dem_raster_path=args.dem_raster_path,
+        require_advanced_geo_on_miss=not args.allow_missing_advanced_geo,
+        terrain_api_url=args.terrain_api_url,
+        terrain_api_batch_size=args.terrain_api_batch_size,
+        terrain_sample_step_m=args.terrain_sample_step_m,
+        output_root=args.output_root,
+        reuse_run_dir=args.reuse_run_dir,
+        reuse_cached_artifacts=not args.disable_reuse_cache,
+    )
+    run_dir = run_rf_debug_lab(config)
+    print(f"[TEST] Artifacts saved under {run_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -57,6 +57,7 @@ uploads/
 outputs/
 data/
 data/reports/
+tests/output/
 
 # Local reports / exports / archives
 *.csv

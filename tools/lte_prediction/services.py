@@ -44,7 +44,17 @@ def _job_df_summary(stage, df):
     for col in ["cell_id", "nodeb_id", "Node_Cell_ID", "node_b_id", "operator", "site_id"]:
         if col in df.columns:
             print(f"[LTE][{stage}] distinct_{col}={int(df[col].nunique(dropna=True))}")
-    for col in ["pred_rsrp", "pred_rsrq", "pred_sinr", "ML_Corrected_RSRP", "ML_Corrected_RSRQ", "ML_Corrected_SINR"]:
+    for col in [
+        "pred_rsrp",
+        "pred_rsrq",
+        "pred_sinr",
+        "pred_rsrp_geo",
+        "pred_rsrq_geo",
+        "pred_sinr_geo",
+        "pred_rsrp_demo",
+        "pred_rsrq_demo",
+        "pred_sinr_demo",
+    ]:
         if col in df.columns:
             print(f"[LTE][{stage}] range_{col}={_metric_range(df, col)}")
 
@@ -138,9 +148,39 @@ class LTEPredictionService:
             )
 
             _job_df_summary("RF_PRED_DF", pred_df)
-            self._update(job_id, "running", "ML Correction")
-            final_df = run_ml_fast(pred_df, drive_df)
-            _job_df_summary("ML_OUTPUT_DF", final_df)
+            self._update(job_id, "running", "Geo correction and smoothing")
+            final_df = run_ml_fast(
+                pred_df,
+                drive_df,
+                site_df=site_df,
+                building_df=building_df,
+                params={
+                    "project_id": cfg["project_id"],
+                    "region": region,
+                    "grid": cfg["grid_resolution"],
+                    "tile_size_m": cfg.get("tile_size_m", 100),
+                    "cluster_count": cfg.get("cluster_count", 5),
+                    "dem_raster_path": cfg.get("dem_raster_path"),
+                    "optimizer_weights_path": cfg.get("optimizer_weights_path"),
+                    "dt_replace_radius_m": cfg.get("dt_replace_radius_m", 20),
+                    "dt_blend_sigma_m": cfg.get("dt_blend_sigma_m", 60),
+                    "dt_blend_radius_m": cfg.get("dt_blend_radius_m", 140),
+                },
+            )
+            _job_df_summary("DISPLAY_OUTPUT_DF", final_df)
+            production_summary = dict(final_df.attrs.get("production_summary") or {})
+            if production_summary:
+                geo_metrics = production_summary.get("geo_validation_metrics")
+                weights_summary = production_summary.get("weights_summary")
+                if weights_summary:
+                    print(f"[LTE][GEO_WEIGHTS] {weights_summary}")
+                if geo_metrics:
+                    print(f"[LTE][GEO_VALIDATION] {geo_metrics}")
+                JOBS[job_id]["metrics"] = {
+                    "baseline": production_summary.get("baseline_validation_metrics"),
+                    "geo": geo_metrics,
+                }
+                JOBS[job_id]["weights"] = weights_summary
 
             self._update(job_id, "running", "Saving results to database")
             self._save_baseline_results(
@@ -186,10 +226,10 @@ class LTEPredictionService:
         if "node_cell_id" in out.columns:
             out["node_cell_id"] = _clean_text_series(out["node_cell_id"])
 
-        # Save corrected KPI values into the baseline prediction columns.
-        out = _coalesce_columns(out, "pred_rsrp", ["ML_Corrected_RSRP", "ml_corrected_rsrp", "pred_rsrp"])
-        out = _coalesce_columns(out, "pred_rsrq", ["ML_Corrected_RSRQ", "ml_corrected_rsrq", "pred_rsrq"])
-        out = _coalesce_columns(out, "pred_sinr", ["ML_Corrected_SINR", "ml_corrected_sinr", "pred_sinr"])
+        # Save final display KPI values into the existing baseline prediction columns.
+        out = _coalesce_columns(out, "pred_rsrp", ["pred_rsrp"])
+        out = _coalesce_columns(out, "pred_rsrq", ["pred_rsrq"])
+        out = _coalesce_columns(out, "pred_sinr", ["pred_sinr"])
 
         if site_df is not None and not site_df.empty:
             site_meta = site_df.copy()

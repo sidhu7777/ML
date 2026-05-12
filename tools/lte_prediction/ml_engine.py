@@ -7,8 +7,15 @@ from shapely.geometry import Point
 from shapely.ops import transform
 from shapely.wkt import loads as load_wkt
 
+from .geo_correction_pipeline import (
+    apply_full_display_correction,
+    align_building_geometries_to_project,
+    align_project_polygon_to_points,
+    building_df_to_gdf,
+    prepare_building_df_for_rf,
+    prepare_site_df_for_source_rf_export,
+)
 from .Sector_wise_prediction_code_copy import run_prediction_from_api
-from .lte_ml_correction_final import run_ml_from_api
 
 
 load_dotenv()
@@ -267,6 +274,13 @@ def fetch_site_data(project_id, region="india"):
     df["Mtilt"] = pd.to_numeric(df["Mtilt"], errors="coerce").fillna(0)
     df["Height"] = pd.to_numeric(df["Height"], errors="coerce").fillna(30)
     df["tx_power"] = pd.to_numeric(df["tx_power"], errors="coerce").fillna(46)
+    if "frequency_mhz" not in df.columns:
+        if "frequency" in df.columns:
+            df["frequency_mhz"] = pd.to_numeric(df["frequency"], errors="coerce").fillna(1800)
+        else:
+            df["frequency_mhz"] = 1800
+    if "Node_Cell_ID" not in df.columns and "cell_id" in df.columns:
+        df["Node_Cell_ID"] = df["cell_id"].astype(str).str.strip()
 
     df = df.dropna(subset=["lat", "lon"])
 
@@ -395,6 +409,7 @@ def fetch_building_data(project_id, region="india"):
         project_id,
         area,
         geometry,
+        ST_AsText(region) AS region_wkt,
         ST_AsText(geometry) AS geometry_wkt
     FROM tbl_savepolygon
     WHERE project_id = {project_id}
@@ -409,6 +424,7 @@ def fetch_building_data(project_id, region="india"):
         extra={
             "distinct_project_id": _safe_nunique(df, "project_id"),
             "non_null_region": _safe_non_null(df, "region"),
+            "non_null_region_wkt": _safe_non_null(df, "region_wkt"),
             "non_null_geometry_wkt": _safe_non_null(df, "geometry_wkt"),
         }
     )
@@ -427,27 +443,40 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     os.makedirs(temp_dir, exist_ok=True)
 
     site_path = f"{temp_dir}/site.csv"
-    drive_path = f"{temp_dir}/drive.csv"
     building_path = f"{temp_dir}/building.csv"
 
-    site_df.to_csv(site_path, index=False)
-    drive_df.to_csv(drive_path, index=False)
-    building_df.to_csv(building_path, index=False)
+    current_engine = engine.get(params.get("region", "india").lower(), engine["india"])
+    polygons = _load_project_polygons(params["project_id"], current_engine)
+    site_export_df = prepare_site_df_for_source_rf_export(site_df)
+    building_export_df = building_df.copy()
+    if polygons:
+        try:
+            import geopandas as gpd
+
+            polygon_gdf = gpd.GeoDataFrame({"geometry": polygons}, crs="EPSG:4326")
+            polygon_gdf, _ = align_project_polygon_to_points(polygon_gdf, site_export_df)
+            building_gdf = building_df_to_gdf(building_df)
+            building_gdf, _ = align_building_geometries_to_project(building_gdf, polygon_gdf)
+            building_export_df = prepare_building_df_for_rf(building_df, building_gdf)
+        except Exception as exc:
+            print(f"[LTE][RF_INPUT] building_geometry_precheck_failed={exc}")
+    site_export_df.to_csv(site_path, index=False)
+    building_export_df.to_csv(building_path, index=False)
 
     print(
-        f"[LTE][RF_INPUT] site_rows={len(site_df)} drive_rows={len(drive_df)} "
-        f"building_rows={len(building_df)} radius={params['radius']} "
+        f"[LTE][RF_INPUT] site_rows={len(site_export_df)} drive_rows={len(drive_df)} "
+        f"building_rows={len(building_export_df)} radius={params['radius']} "
         f"grid={params['grid']} workers={params['workers']} "
         f"max_interference_sites={params.get('max_interference_sites', 50)}"
     )
     print(
-        f"[LTE][RF_INPUT] unique_cells={_safe_nunique(site_df, 'cell_id')} "
-        f"unique_pci={_safe_nunique(site_df, 'PCI') if 'PCI' in site_df.columns else _safe_nunique(site_df, 'pci')}"
+        f"[LTE][RF_INPUT] unique_cells={_safe_nunique(site_export_df, 'cell_id')} "
+        f"unique_pci={_safe_nunique(site_export_df, 'PCI') if 'PCI' in site_export_df.columns else _safe_nunique(site_export_df, 'pci')}"
     )
 
     run_prediction_from_api({
         "site": site_path,
-        "drive": drive_path,
+        "drive": None,
         "building": building_path,
         "polygon_area": None,
         "radius": params["radius"],
@@ -460,11 +489,10 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         "outdir": temp_dir,
         "n_workers": params["workers"],
         "max_interference_sites": params.get("max_interference_sites", 50),
-        "calibrate": True
+        "calibrate": False
     })
 
     pred_df = pd.read_csv(f"{temp_dir}/prediction_ALL_SITES.csv")
-    current_engine = engine.get(params.get("region", "india").lower(), engine["india"])
     pred_df, polygon_stats = _apply_prediction_polygon_filter(
         pred_df, params["project_id"], current_engine
     )
@@ -481,7 +509,8 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
             "radius": params["radius"],
             "grid": params["grid"],
             "project_id": params["project_id"],
-            "region": params.get("region", "india")
+            "region": params.get("region", "india"),
+            "calibrate": False,
         },
         pred_df,
         extra={
@@ -494,14 +523,24 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     return pred_df
 
 
-def run_ml_fast(pred_df, drive_df):
+def run_ml_fast(pred_df, drive_df, site_df=None, building_df=None, params=None):
     print(
-        f"[LTE][ML_INPUT] pred_rows={len(pred_df)} drive_rows={len(drive_df)} "
+        f"[LTE][POST_INPUT] pred_rows={len(pred_df)} drive_rows={len(drive_df)} "
         f"pred_cols={list(pred_df.columns)} drive_cols={list(drive_df.columns)}"
     )
-    return run_ml_from_api(pred_df, drive_df)
+    if site_df is None or building_df is None or params is None:
+        raise ValueError("Geo/display correction requires site_df, building_df, and params")
 
-
-def grid_drive_test(input_file, output_file):
-    df = pd.read_csv(input_file)
-    df.to_csv(output_file, index=False)
+    current_engine = engine.get(params.get("region", "india").lower(), engine["india"])
+    polygons = _load_project_polygons(params["project_id"], current_engine)
+    final_df, summary = apply_full_display_correction(
+        pred_df,
+        drive_df,
+        site_df,
+        building_df,
+        polygons,
+        params=params,
+    )
+    final_df.attrs["production_summary"] = summary
+    print(f"[LTE][POST_OUTPUT] summary={summary}")
+    return final_df
