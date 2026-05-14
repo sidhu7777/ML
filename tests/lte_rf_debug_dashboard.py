@@ -35,6 +35,8 @@ from tests.lte_rf_debug_lab import (
     RunConfig,
     run_rf_debug_lab,
 )
+from tests.lte_rf_optimization_test import OptimizationTestConfig, run_optimization_test
+from tests.lte_tilt_recommendation_test import TiltRecommendationTestConfig, run_tilt_recommendation_test
 
 
 OUTPUT_ROOT = Path("tests/output")
@@ -58,8 +60,48 @@ def _list_runs(project_id: int) -> List[Path]:
     return sorted(runs, key=lambda p: p.name, reverse=True)
 
 
+def _list_baseline_runs(project_id: int) -> List[Path]:
+    out: List[Path] = []
+    for run in _list_runs(project_id):
+        summary = _load_summary(run)
+        run_type = summary.get("run_type")
+        if run_type in {"optimization_test", "tilt_recommendation_test"}:
+            continue
+        if run.name.startswith("optimization_") or run.name.startswith("tilt_"):
+            continue
+        out.append(run)
+    return out
+
+
+def _list_optimization_runs(project_id: int) -> List[Path]:
+    out: List[Path] = []
+    for run in _list_runs(project_id):
+        summary = _load_summary(run)
+        if summary.get("run_type") == "optimization_test" or run.name.startswith("optimization_"):
+            out.append(run)
+    return out
+
+
+def _list_tilt_runs(project_id: int) -> List[Path]:
+    out: List[Path] = []
+    for run in _list_runs(project_id):
+        summary = _load_summary(run)
+        if summary.get("run_type") == "tilt_recommendation_test" or run.name.startswith("tilt_"):
+            out.append(run)
+    return out
+
+
 def _load_summary(run_dir: Path) -> Dict:
     return json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+
+
+def _safe_read_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
 
 def _metric_row(title: str, metrics: Dict[str, float]) -> None:
@@ -613,12 +655,479 @@ def _render_signal_image(
         _plot_panel(*panels[2])
 
 
+def _prepare_optimization_compare(opt_run_dir: Path) -> Dict[str, pd.DataFrame]:
+    baseline_df = pd.read_parquet(opt_run_dir / "baseline_smoothed_latest.parquet") if (opt_run_dir / "baseline_smoothed_latest.parquet").exists() else pd.DataFrame()
+    optimized_affected_df = pd.read_parquet(opt_run_dir / "optimized_affected_predictions.parquet") if (opt_run_dir / "optimized_affected_predictions.parquet").exists() else pd.DataFrame()
+    optimized_merged_df = pd.read_parquet(opt_run_dir / "optimized_merged_predictions.parquet") if (opt_run_dir / "optimized_merged_predictions.parquet").exists() else pd.DataFrame()
+    compare_df = pd.DataFrame()
+    if not baseline_df.empty and not optimized_affected_df.empty:
+        before = baseline_df.copy()
+        after = optimized_affected_df.copy()
+        for frame in (before, after):
+            for col in ["lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr"]:
+                if col in frame.columns:
+                    frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            if "Node_Cell_ID" in frame.columns:
+                frame["Node_Cell_ID"] = frame["Node_Cell_ID"].astype(str)
+        compare_df = before.merge(
+            after[["Node_Cell_ID", "lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr"]],
+            on=["Node_Cell_ID", "lat", "lon"],
+            how="inner",
+            suffixes=("_before", "_after"),
+        )
+        if not compare_df.empty:
+            compare_df["site_id"] = compare_df["Node_Cell_ID"].astype(str).str.split("_").str[0]
+            compare_df["delta_rsrp"] = compare_df["pred_rsrp_after"] - compare_df["pred_rsrp_before"]
+            compare_df["delta_rsrq"] = compare_df["pred_rsrq_after"] - compare_df["pred_rsrq_before"]
+            compare_df["delta_sinr"] = compare_df["pred_sinr_after"] - compare_df["pred_sinr_before"]
+    return {"baseline_df": baseline_df, "optimized_affected_df": optimized_affected_df, "optimized_merged_df": optimized_merged_df, "compare_df": compare_df}
+
+
+def _render_optimization_site_changes(site_before_df: pd.DataFrame, changed_df: pd.DataFrame) -> None:
+    if site_before_df.empty or changed_df.empty:
+        return
+    before = site_before_df.copy()
+    after = changed_df.copy()
+    for frame in (before, after):
+        if "Node_Cell_ID" in frame.columns:
+            frame["Node_Cell_ID"] = frame["Node_Cell_ID"].astype(str)
+    keep_cols = ["Node_Cell_ID", "lat", "lon", "azimuth", "electrical_tilt", "mechanical_tilt", "tx_power", "antenna_height"]
+    before = before[[c for c in keep_cols if c in before.columns]].copy()
+    after = after[[c for c in keep_cols if c in after.columns]].copy()
+    merged = before.merge(after, on="Node_Cell_ID", how="inner", suffixes=("_before", "_after"))
+    st.markdown("**Changed Site Parameters**")
+    st.dataframe(merged, use_container_width=True)
+
+
+def _render_optimization_kpi_summary(compare_df: pd.DataFrame) -> None:
+    if compare_df.empty:
+        st.info("No optimization KPI comparison rows available yet.")
+        return
+    rows = []
+    for metric, before_col, after_col, delta_col in [
+        ("RSRP", "pred_rsrp_before", "pred_rsrp_after", "delta_rsrp"),
+        ("RSRQ", "pred_rsrq_before", "pred_rsrq_after", "delta_rsrq"),
+        ("SINR", "pred_sinr_before", "pred_sinr_after", "delta_sinr"),
+    ]:
+        rows.append({
+            "metric": metric,
+            "before_mean": round(float(compare_df[before_col].mean()), 4),
+            "after_mean": round(float(compare_df[after_col].mean()), 4),
+            "delta_mean": round(float(compare_df[delta_col].mean()), 4),
+            "delta_min": round(float(compare_df[delta_col].min()), 4),
+            "delta_max": round(float(compare_df[delta_col].max()), 4),
+        })
+    st.markdown("**Affected KPI Summary**")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    by_site = compare_df.groupby("site_id", dropna=False).agg(
+        rows=("site_id", "size"),
+        rsrp_delta_mean=("delta_rsrp", "mean"),
+        rsrq_delta_mean=("delta_rsrq", "mean"),
+        sinr_delta_mean=("delta_sinr", "mean"),
+    ).reset_index()
+    for col in ["rsrp_delta_mean", "rsrq_delta_mean", "sinr_delta_mean"]:
+        by_site[col] = by_site[col].round(4)
+    st.markdown("**Affected Site KPI Delta**")
+    st.dataframe(by_site, use_container_width=True)
+
+
+def _render_optimization_visuals(compare_df: pd.DataFrame) -> None:
+    if compare_df.empty:
+        return
+    metric_choice = st.selectbox(
+        "Optimization KPI View",
+        options=[
+            ("RSRP", "pred_rsrp_before", "pred_rsrp_after", "delta_rsrp"),
+            ("RSRQ", "pred_rsrq_before", "pred_rsrq_after", "delta_rsrq"),
+            ("SINR", "pred_sinr_before", "pred_sinr_after", "delta_sinr"),
+        ],
+        format_func=lambda item: item[0],
+        index=0,
+        key="opt_metric_choice",
+    )
+    _, before_col, after_col, delta_col = metric_choice
+    row = st.columns(3)
+    before_fig = px.scatter(compare_df, x="lon", y="lat", color=before_col, title=f"{metric_choice[0]} Before", color_continuous_scale="Viridis", opacity=0.7)
+    after_fig = px.scatter(compare_df, x="lon", y="lat", color=after_col, title=f"{metric_choice[0]} After", color_continuous_scale="Viridis", opacity=0.7)
+    delta_limit = max(abs(float(compare_df[delta_col].min())), abs(float(compare_df[delta_col].max())), 0.1)
+    delta_fig = px.scatter(compare_df, x="lon", y="lat", color=delta_col, title=f"{metric_choice[0]} Delta", color_continuous_scale="RdBu", range_color=[-delta_limit, delta_limit], opacity=0.75)
+    with row[0]:
+        st.plotly_chart(before_fig, use_container_width=True)
+    with row[1]:
+        st.plotly_chart(after_fig, use_container_width=True)
+    with row[2]:
+        st.plotly_chart(delta_fig, use_container_width=True)
+    hist = go.Figure()
+    hist.add_trace(go.Histogram(x=compare_df[before_col], name="Before", opacity=0.55, marker_color="#2563eb"))
+    hist.add_trace(go.Histogram(x=compare_df[after_col], name="After", opacity=0.55, marker_color="#dc2626"))
+    hist.update_layout(title=f"{metric_choice[0]} Distribution Before vs After", barmode="overlay", height=380)
+    st.plotly_chart(hist, use_container_width=True)
+    delta_hist = px.histogram(compare_df, x=delta_col, nbins=40, title=f"{metric_choice[0]} Delta Distribution")
+    st.plotly_chart(delta_hist, use_container_width=True)
+
+
+def _render_optimization_page(project_id: int) -> None:
+    opt_runs = _list_optimization_runs(int(project_id))
+    st.subheader("Optimization Test Runs")
+    if not opt_runs:
+        st.info("No optimization test runs found yet. Use the sidebar optimization button to launch one.")
+        return
+    opt_labels = [run.name for run in opt_runs]
+    selected_opt_label = st.selectbox("Available Optimization Runs", options=opt_labels, index=0)
+    opt_run_dir = next(run for run in opt_runs if run.name == selected_opt_label)
+    opt_summary = _load_summary(opt_run_dir)
+    latency_df = pd.read_csv(opt_run_dir / "latency_log.csv") if (opt_run_dir / "latency_log.csv").exists() else pd.DataFrame()
+    changed_df = pd.read_csv(opt_run_dir / "site_changed_rows.csv") if (opt_run_dir / "site_changed_rows.csv").exists() else pd.DataFrame()
+    site_before_df = pd.read_csv(opt_run_dir / "site_before.csv") if (opt_run_dir / "site_before.csv").exists() else pd.DataFrame()
+    opt_site_df = pd.read_csv(opt_run_dir / "site_after.csv") if (opt_run_dir / "site_after.csv").exists() else pd.DataFrame()
+    prepared = _prepare_optimization_compare(opt_run_dir)
+    compare_df = prepared["compare_df"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Optimization Runtime (sec)", opt_summary.get("total_runtime_sec"))
+    c2.metric("Affected Sites", opt_summary.get("counts", {}).get("affected_sites"))
+    c3.metric("Affected Cells", opt_summary.get("counts", {}).get("affected_cells"))
+    c4.metric("K1/K2 Cells", opt_summary.get("counts", {}).get("k1k2_cells"))
+    st.json({
+        "baseline_job_id": opt_summary.get("baseline_job_id"),
+        "target_type": opt_summary.get("target_type"),
+        "target_id": opt_summary.get("target_id"),
+        "impact_radius_m": opt_summary.get("impact_radius_m"),
+        "neighbor_site_count": opt_summary.get("neighbor_site_count"),
+        "max_interference_sites": opt_summary.get("max_interference_sites"),
+        "changes": opt_summary.get("changes", {}),
+        "affected_sites": opt_summary.get("affected_sites", []),
+        "affected_cells": opt_summary.get("affected_cells", []),
+    })
+    if not latency_df.empty:
+        st.markdown("**Optimization Latency Log**")
+        st.dataframe(latency_df, use_container_width=True)
+    _render_optimization_site_changes(site_before_df, changed_df)
+    _render_optimization_kpi_summary(compare_df)
+    st.subheader("Optimization Visualizations")
+    _render_optimization_visuals(compare_df)
+    if not compare_df.empty:
+        st.markdown("**Affected Point-Level KPI Changes**")
+        st.dataframe(compare_df.head(500), use_container_width=True)
+    if not opt_site_df.empty and not prepared["optimized_merged_df"].empty:
+        polygon_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        baseline_runs = _list_baseline_runs(int(project_id))
+        if baseline_runs:
+            polygon_path = baseline_runs[0] / "project_polygon.geojson"
+            if polygon_path.exists():
+                polygon_gdf = gpd.read_file(polygon_path)
+        st.subheader("Optimization Map")
+        _render_map(
+            _build_map(
+                polygon_gdf,
+                _prepare_site_selection_df(opt_site_df),
+                pd.DataFrame(columns=["lat", "lon"]),
+                prepared["optimized_merged_df"],
+                buildings_gdf=None,
+                grid_gdf=None,
+                show_geo=False,
+                kpi_col="pred_rsrp",
+            ),
+            "optimization_map",
+        )
+
+
+def _prepare_tilt_recommendation_compare(run_dir: Path) -> Dict[str, pd.DataFrame]:
+    bad_summary = _safe_read_csv(run_dir / "bad_summary.csv")
+    forecast_df = _safe_read_csv(run_dir / "forecast.csv")
+    reco_df = _safe_read_csv(run_dir / "recommendations.csv")
+    bad_geo_df = _safe_read_csv(run_dir / "bad_samples_with_geo.csv")
+    antenna_df = _safe_read_csv(run_dir / "antenna_input.csv")
+    geo_summary_df = _safe_read_csv(run_dir / "bad_geo_cell_summary.csv")
+    bearing_df = _safe_read_csv(run_dir / "dominant_bearing_summary.csv")
+
+    changed_reco_df = pd.DataFrame()
+    if not reco_df.empty:
+        changed_reco_df = reco_df.copy()
+        changed_reco_df["Current Value"] = pd.to_numeric(changed_reco_df["Current Value"], errors="coerce")
+        changed_reco_df["Recommended Value"] = pd.to_numeric(changed_reco_df["Recommended Value"], errors="coerce")
+        changed_reco_df["delta"] = changed_reco_df["Recommended Value"] - changed_reco_df["Current Value"]
+        changed_reco_df = changed_reco_df[
+            changed_reco_df["delta"].notna() & (changed_reco_df["delta"].abs() > 1e-9)
+        ].copy()
+
+    forecast_compare_df = pd.DataFrame()
+    if not forecast_df.empty:
+        forecast_compare_df = forecast_df.copy()
+        forecast_compare_df["Pre-Change"] = pd.to_numeric(forecast_compare_df["Pre-Change"], errors="coerce")
+        forecast_compare_df["Est. Post-Change"] = pd.to_numeric(forecast_compare_df["Est. Post-Change"], errors="coerce")
+        forecast_compare_df["estimated_delta_bad_samples"] = (
+            forecast_compare_df["Est. Post-Change"] - forecast_compare_df["Pre-Change"]
+        )
+
+    return {
+        "bad_summary": bad_summary,
+        "forecast_df": forecast_df,
+        "recommendations_df": reco_df,
+        "changed_recommendations_df": changed_reco_df,
+        "bad_samples_with_geo_df": bad_geo_df,
+        "antenna_df": antenna_df,
+        "geo_summary_df": geo_summary_df,
+        "bearing_df": bearing_df,
+        "forecast_compare_df": forecast_compare_df,
+    }
+
+
+def _render_tilt_recommendation_summary(summary: Dict, changed_reco_df: pd.DataFrame, forecast_df: pd.DataFrame) -> None:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tilt Runtime (sec)", summary.get("total_runtime_sec"))
+    c2.metric("Bad Samples", summary.get("counts", {}).get("bad_samples"))
+    c3.metric("Bad Cells", summary.get("counts", {}).get("bad_cells"))
+    c4.metric("Swap Sector Yes", summary.get("counts", {}).get("swap_sector_yes"))
+    st.json(
+        {
+            "project_id": summary.get("project_id"),
+            "region": summary.get("region"),
+            "operator": summary.get("operator"),
+            "thresholds": summary.get("thresholds", {}),
+        }
+    )
+    if not changed_reco_df.empty:
+        st.markdown("**Changed Recommendation Counts**")
+        counts = (
+            changed_reco_df.groupby("Parameter", dropna=False)
+            .size()
+            .reset_index(name="changed_rows")
+            .sort_values("changed_rows", ascending=False)
+        )
+        st.dataframe(counts, use_container_width=True)
+    if not forecast_df.empty:
+        total_pre = pd.to_numeric(forecast_df["Pre-Change"], errors="coerce").sum()
+        total_post = pd.to_numeric(forecast_df["Est. Post-Change"], errors="coerce").sum()
+        total_delta = total_post - total_pre
+        st.metric("Estimated Total Bad-Sample Delta", round(float(total_delta), 2))
+
+
+def _render_tilt_recommendation_tables(changed_reco_df: pd.DataFrame, geo_summary_df: pd.DataFrame, bearing_df: pd.DataFrame) -> None:
+    if not changed_reco_df.empty:
+        st.markdown("**Recommended Parameter Changes**")
+        st.dataframe(
+            changed_reco_df[
+                ["Cell ID", "Technology", "Parameter", "Current Value", "Recommended Value", "delta", "Swap Sector Detected", "Reason"]
+            ],
+            use_container_width=True,
+        )
+    if not geo_summary_df.empty:
+        st.markdown("**Bad-Sample Geo Context by Cell**")
+        st.dataframe(geo_summary_df, use_container_width=True)
+    if not bearing_df.empty:
+        st.markdown("**Dominant Bearing Summary**")
+        st.dataframe(bearing_df, use_container_width=True)
+
+
+def _render_tilt_recommendation_visuals(forecast_compare_df: pd.DataFrame, changed_reco_df: pd.DataFrame) -> None:
+    if not forecast_compare_df.empty:
+        st.subheader("Before / After Forecast")
+        kpi_choice = st.selectbox(
+            "Forecast KPI",
+            options=sorted(forecast_compare_df["KPI"].dropna().astype(str).unique().tolist()),
+            key="tilt_forecast_kpi",
+        )
+        work = forecast_compare_df[forecast_compare_df["KPI"].astype(str) == str(kpi_choice)].copy()
+        if not work.empty:
+            work = work.sort_values("Pre-Change", ascending=False)
+            bar_fig = go.Figure()
+            bar_fig.add_trace(
+                go.Bar(
+                    x=work["Cell ID"],
+                    y=work["Pre-Change"],
+                    name="Before",
+                    marker_color="#2563eb",
+                )
+            )
+            bar_fig.add_trace(
+                go.Bar(
+                    x=work["Cell ID"],
+                    y=work["Est. Post-Change"],
+                    name="Estimated After",
+                    marker_color="#dc2626",
+                )
+            )
+            bar_fig.update_layout(
+                title=f"{kpi_choice} Bad Samples Before vs Estimated After",
+                barmode="group",
+                xaxis_title="Cell ID",
+                yaxis_title="Bad Sample Count",
+                height=420,
+            )
+            st.plotly_chart(bar_fig, use_container_width=True)
+
+            delta_fig = px.bar(
+                work,
+                x="Cell ID",
+                y="estimated_delta_bad_samples",
+                color="estimated_delta_bad_samples",
+                color_continuous_scale="RdBu",
+                title=f"{kpi_choice} Estimated Change in Bad Sample Count",
+            )
+            st.plotly_chart(delta_fig, use_container_width=True)
+
+    if not changed_reco_df.empty:
+        st.subheader("Recommendation Mix")
+        mix = changed_reco_df.copy()
+        mix["label"] = mix["Parameter"].astype(str) + " " + mix["delta"].round(2).astype(str)
+        pie_fig = px.pie(
+            mix,
+            names="label",
+            title="Changed Recommendations Distribution",
+        )
+        st.plotly_chart(pie_fig, use_container_width=True)
+
+
+def _render_tilt_bad_sample_map(
+    antenna_df: pd.DataFrame,
+    bad_geo_df: pd.DataFrame,
+    changed_reco_df: pd.DataFrame,
+) -> None:
+    if antenna_df.empty:
+        st.info("No antenna data available for tilt visualization.")
+        return
+
+    site_df = antenna_df.copy()
+    site_df = _prepare_site_selection_df(site_df)
+    polygon_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    if changed_reco_df.empty and bad_geo_df.empty:
+        st.info("No tilt visualization data available yet.")
+        return
+
+    metric_choice = st.selectbox(
+        "Bad Sample KPI Layer",
+        options=[
+            ("RSRP", "Bad RSRP"),
+            ("RSRQ", "Bad RSRQ"),
+            ("SINR", "Bad SINR"),
+        ],
+        format_func=lambda item: item[0],
+        key="tilt_bad_sample_metric",
+    )[1]
+
+    bad_map_df = bad_geo_df.copy()
+    if not bad_map_df.empty:
+        lat_col = next((c for c in ["lat", "latitude"] if c in bad_map_df.columns), None)
+        lon_col = next((c for c in ["lon", "longitude"] if c in bad_map_df.columns), None)
+        if lat_col and lon_col:
+            bad_map_df = bad_map_df[
+                bad_map_df[metric_choice].astype(bool)
+            ].copy()
+            metric_name = metric_choice.split()[-1]
+            value_col = next(
+                (
+                    c for c in ["RSRP_eval", "RSRQ_eval", "SINR_eval"]
+                    if c in bad_map_df.columns and metric_name in c
+                ),
+                None,
+            )
+            bad_map_df = pd.DataFrame(
+                {
+                    "lat": pd.to_numeric(bad_map_df[lat_col], errors="coerce"),
+                    "lon": pd.to_numeric(bad_map_df[lon_col], errors="coerce"),
+                    "pred_rsrp": (
+                        pd.to_numeric(bad_map_df[value_col], errors="coerce")
+                        if value_col else pd.Series(-100.0, index=bad_map_df.index)
+                    ),
+                    "Node_Cell_ID": bad_map_df["Cell ID"].astype(str) if "Cell ID" in bad_map_df.columns else "",
+                }
+            ).dropna(subset=["lat", "lon", "pred_rsrp"])
+        else:
+            bad_map_df = pd.DataFrame(columns=["lat", "lon", "pred_rsrp"])
+
+    st.markdown("**Tilt Recommendation Map**")
+    fmap = _build_map(
+        polygon_gdf,
+        site_df,
+        pd.DataFrame(columns=["lat", "lon"]),
+        bad_map_df if not bad_map_df.empty else pd.DataFrame(columns=["lat", "lon", "pred_rsrp"]),
+        buildings_gdf=None,
+        grid_gdf=None,
+        show_geo=False,
+        kpi_col="pred_rsrp",
+        show_site_markers=True,
+    )
+
+    if not changed_reco_df.empty:
+        site_reco = changed_reco_df.copy()
+        site_reco["site_id"] = site_reco["Cell ID"].astype(str).str.split("_").str[0]
+        pivot = (
+            site_reco.pivot_table(
+                index="site_id",
+                columns="Parameter",
+                values="delta",
+                aggfunc="first",
+            )
+            .reset_index()
+        )
+        site_points = site_df.drop_duplicates(subset=["dashboard_nodeb_id"]).copy()
+        site_points = site_points.merge(
+            pivot,
+            left_on="dashboard_nodeb_id",
+            right_on="site_id",
+            how="inner",
+        )
+        for _, row in site_points.iterrows():
+            popup_lines = [f"Site {row.get('dashboard_nodeb_id')}"]
+            for param in ["ETilt", "Azimuth", "TX Power"]:
+                if param in row and pd.notna(row[param]) and abs(float(row[param])) > 1e-9:
+                    popup_lines.append(f"{param} delta={float(row[param]):.2f}")
+            folium.CircleMarker(
+                location=[float(row["lat"]), float(row["lon"])],
+                radius=6,
+                color="#dc2626",
+                weight=2,
+                fill=True,
+                fill_color="#f97316",
+                fill_opacity=0.9,
+                tooltip=" | ".join(popup_lines),
+            ).add_to(fmap)
+
+    _render_map(fmap, "tilt_map")
+
+
+def _render_tilt_recommendation_page(project_id: int) -> None:
+    tilt_runs = _list_tilt_runs(int(project_id))
+    st.subheader("Tilt Recommendation Test Runs")
+    if not tilt_runs:
+        st.info("No tilt recommendation test runs found yet. Use the sidebar tilt button to launch one.")
+        return
+    tilt_labels = [run.name for run in tilt_runs]
+    selected_label = st.selectbox("Available Tilt Runs", options=tilt_labels, index=0)
+    run_dir = next(run for run in tilt_runs if run.name == selected_label)
+    summary = _load_summary(run_dir)
+    prepared = _prepare_tilt_recommendation_compare(run_dir)
+
+    _render_tilt_recommendation_summary(
+        summary,
+        prepared["changed_recommendations_df"],
+        prepared["forecast_df"],
+    )
+    _render_tilt_recommendation_tables(
+        prepared["changed_recommendations_df"],
+        prepared["geo_summary_df"],
+        prepared["bearing_df"],
+    )
+    _render_tilt_recommendation_visuals(
+        prepared["forecast_compare_df"],
+        prepared["changed_recommendations_df"],
+    )
+    _render_tilt_bad_sample_map(
+        prepared["antenna_df"],
+        prepared["bad_samples_with_geo_df"],
+        prepared["changed_recommendations_df"],
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="LTE RF Debug Dashboard", layout="wide")
     st.title("LTE RF Debug Dashboard")
     st.caption("Test-only RF lab for project 196. Reads from DB, uses DT only for validation, keeps baseline RF non-calibrated, and compares it against a test-only geo-adjusted experiment.")
 
     st.sidebar.header("Run Controls")
+    dashboard_page = st.sidebar.radio("Dashboard Page", options=["RF Debug", "Optimization", "Tilt Recommendation"], index=0)
     with st.sidebar.form("rf_debug_run_form"):
         project_id = st.number_input("Project ID", value=DEFAULT_PROJECT_ID, step=1)
         session_input = st.text_input("Session IDs", value=",".join(map(str, DEFAULT_SESSION_IDS)))
@@ -663,241 +1172,313 @@ def main() -> None:
             run_dir = run_rf_debug_lab(config)
         st.success(f"Run completed: {run_dir}")
 
-    runs = _list_runs(int(project_id))
-    if not runs:
-        st.info("No RF debug runs found yet. Use the sidebar to launch one.")
+    st.sidebar.header("Optimization Test")
+    with st.sidebar.form("rf_optimization_test_form"):
+        opt_target_type = st.selectbox("Target Type", options=["site", "cell"], index=0)
+        opt_target_id = st.text_input("Target ID", value="")
+        opt_impact_radius_m = st.number_input("Impact Radius (m)", value=1200.0, step=100.0, min_value=100.0)
+        opt_delta_lat = st.number_input("Delta Latitude", value=0.0, step=0.0001, format="%.6f")
+        opt_delta_lon = st.number_input("Delta Longitude", value=0.0, step=0.0001, format="%.6f")
+        opt_delta_azimuth = st.number_input("Delta Azimuth", value=0.0, step=1.0)
+        opt_delta_etilt = st.number_input("Delta Electrical Tilt", value=0.0, step=0.5)
+        opt_delta_mtilt = st.number_input("Delta Mechanical Tilt", value=0.0, step=0.5)
+        opt_delta_tx = st.number_input("Delta TX Power", value=0.0, step=0.5)
+        opt_delta_height = st.number_input("Delta Antenna Height", value=0.0, step=0.5)
+        opt_neighbor_site_count = st.number_input("Neighbor Site Count", value=2, step=1, min_value=0)
+        opt_max_interference_sites = st.number_input("Max Optimization Interference Sites", value=20, step=1, min_value=1)
+        opt_workers = st.number_input("Optimization Workers", value=DEFAULT_WORKERS, step=1, min_value=1)
+        opt_grid_resolution_m = st.number_input("Optimization Grid Resolution (m)", value=DEFAULT_GRID_RESOLUTION_M, step=5.0)
+        opt_radius_m = st.number_input("Optimization Radius (m)", value=DEFAULT_RADIUS_M, step=50.0)
+        opt_run_triggered = st.form_submit_button("Run Optimization Test", type="primary")
+    if opt_run_triggered:
+        if not opt_target_id.strip():
+            st.error("Target ID is required for the optimization test.")
+        else:
+            opt_config = OptimizationTestConfig(
+                project_id=int(project_id),
+                region=region,
+                target_type=opt_target_type,
+                target_id=opt_target_id.strip(),
+                impact_radius_m=float(opt_impact_radius_m),
+                delta_lat=float(opt_delta_lat),
+                delta_lon=float(opt_delta_lon),
+                delta_azimuth=float(opt_delta_azimuth),
+                delta_electrical_tilt=float(opt_delta_etilt),
+                delta_mechanical_tilt=float(opt_delta_mtilt),
+                delta_tx_power=float(opt_delta_tx),
+                delta_antenna_height=float(opt_delta_height),
+                neighbor_site_count=int(opt_neighbor_site_count),
+                max_interference_sites=int(opt_max_interference_sites),
+                workers=int(opt_workers),
+                grid_resolution_m=float(opt_grid_resolution_m),
+                radius_m=float(opt_radius_m),
+                output_root=OUTPUT_ROOT,
+            )
+            with st.spinner("Running optimization test using the saved smoothed baseline results."):
+                opt_run_dir = run_optimization_test(opt_config)
+            st.success(f"Optimization test completed: {opt_run_dir}")
+
+    st.sidebar.header("Tilt Recommendation Test")
+    with st.sidebar.form("tilt_recommendation_test_form"):
+        tilt_operator = st.text_input("Tilt Operator", value="Airtel")
+        tilt_rsrp = st.number_input("Tilt RSRP Threshold", value=-105.0, step=1.0)
+        tilt_rsrq = st.number_input("Tilt RSRQ Threshold", value=-15.0, step=1.0)
+        tilt_sinr = st.number_input("Tilt SINR Threshold", value=0.0, step=1.0)
+        tilt_run_triggered = st.form_submit_button("Run Tilt Recommendation Test", type="primary")
+    if tilt_run_triggered:
+        tilt_config = TiltRecommendationTestConfig(
+            project_id=int(project_id),
+            region=region,
+            operator=tilt_operator.strip() or None,
+            rsrp_threshold=float(tilt_rsrp),
+            rsrq_threshold=float(tilt_rsrq),
+            sinr_threshold=float(tilt_sinr),
+            output_root=OUTPUT_ROOT,
+        )
+        with st.spinner("Running tilt recommendation test using baseline + geo context."):
+            tilt_run_dir = run_tilt_recommendation_test(tilt_config)
+        st.success(f"Tilt recommendation test completed: {tilt_run_dir}")
+
+    if dashboard_page == "Optimization":
+        _render_optimization_page(int(project_id))
+        return
+    if dashboard_page == "Tilt Recommendation":
+        _render_tilt_recommendation_page(int(project_id))
         return
 
-    run_labels = [run.name for run in runs]
-    selected_label = st.selectbox("Available Runs", options=run_labels, index=0)
-    run_dir = next(run for run in runs if run.name == selected_label)
-    summary = _load_summary(run_dir)
+    runs = _list_baseline_runs(int(project_id))
+    if not runs:
+        st.info("No RF debug runs found yet. Use the sidebar to launch one.")
+    else:
+        run_labels = [run.name for run in runs]
+        selected_label = st.selectbox("Available RF Debug Runs", options=run_labels, index=0)
+        run_dir = next(run for run in runs if run.name == selected_label)
+        summary = _load_summary(run_dir)
 
-    st.subheader("Run Summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Runtime (sec)", summary.get("total_runtime_sec"))
-    c2.metric("RF Grid Rows", summary.get("rows", {}).get("rf_prediction_grid"))
-    c3.metric("Accuracy Points", summary.get("rows", {}).get("rf_accuracy_points"))
-    c4.metric("Building Polygons", summary.get("rows", {}).get("building_polygons"))
+        st.subheader("Run Summary")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Runtime (sec)", summary.get("total_runtime_sec"))
+        c2.metric("RF Grid Rows", summary.get("rows", {}).get("rf_prediction_grid"))
+        c3.metric("Accuracy Points", summary.get("rows", {}).get("rf_accuracy_points"))
+        c4.metric("Building Polygons", summary.get("rows", {}).get("building_polygons"))
 
-    st.markdown("**Timing Breakdown**")
-    timings_df = pd.DataFrame(
-        [{"step": key, "seconds": value} for key, value in summary.get("timings_sec", {}).items()]
-    )
-    if not timings_df.empty:
-        st.dataframe(timings_df, use_container_width=True)
+        st.markdown("**Timing Breakdown**")
+        timings_df = pd.DataFrame(
+            [{"step": key, "seconds": value} for key, value in summary.get("timings_sec", {}).items()]
+        )
+        if not timings_df.empty:
+            st.dataframe(timings_df, use_container_width=True)
 
-    if summary.get("building_alignment"):
-        st.markdown(f"**Building Alignment**: `{summary['building_alignment']}`")
-    if summary.get("production_style_prediction"):
-        st.markdown("**Prediction Mode**: `production_style_rf_polygon`")
-    if summary.get("holdout_strategy"):
-        if summary.get("holdout_strategy") == "validation_only_sessions":
-            st.markdown(
-                f"**Validation Mode**: `dt_validation_only` | "
-                f"validation_sessions=`{summary.get('holdout_sessions', [])}`"
+        if summary.get("building_alignment"):
+            st.markdown(f"**Building Alignment**: `{summary['building_alignment']}`")
+        if summary.get("production_style_prediction"):
+            st.markdown("**Prediction Mode**: `production_style_rf_polygon`")
+        if summary.get("holdout_strategy"):
+            if summary.get("holdout_strategy") == "validation_only_sessions":
+                st.markdown(
+                    f"**Validation Mode**: `dt_validation_only` | "
+                    f"validation_sessions=`{summary.get('holdout_sessions', [])}`"
+                )
+            else:
+                st.markdown(
+                    f"**Validation Split**: `{summary['holdout_strategy']}` | "
+                    f"train_sessions=`{summary.get('train_sessions', [])}` | "
+                    f"holdout_sessions=`{summary.get('holdout_sessions', [])}`"
+                )
+
+        feature_diag = summary.get("feature_diagnostics", {})
+        if feature_diag:
+            st.markdown("**Feature Diagnostics**")
+            feature_diag_df = pd.DataFrame(
+                [{"feature": key, **value} for key, value in feature_diag.items()]
             )
-        else:
-            st.markdown(
-                f"**Validation Split**: `{summary['holdout_strategy']}` | "
-                f"train_sessions=`{summary.get('train_sessions', [])}` | "
-                f"holdout_sessions=`{summary.get('holdout_sessions', [])}`"
+            st.dataframe(feature_diag_df, use_container_width=True)
+
+        cluster_counts = summary.get("cluster_counts", {})
+        if cluster_counts:
+            st.markdown("**Cluster Counts**")
+            cluster_df = pd.DataFrame(
+                [{"morphology_cluster": key, "count": value} for key, value in cluster_counts.items()]
+            )
+            st.dataframe(cluster_df, use_container_width=True)
+
+        experimental_model = summary.get("experimental_model", {})
+        if experimental_model:
+            st.markdown("**Experimental Model**")
+            experimental_df = pd.DataFrame(
+                [
+                    {
+                        "metric": metric,
+                        "train_rows": info.get("train_rows"),
+                        "feature_count": info.get("feature_count"),
+                        "top_features": ", ".join(
+                            f"{name}={value}" for name, value in info.get("top_features", {}).items()
+                        ),
+                    }
+                    for metric, info in experimental_model.items()
+                ]
+            )
+            st.dataframe(experimental_df, use_container_width=True)
+
+        artifacts = summary["artifacts"]
+        polygon_gdf = gpd.read_file(artifacts["project_polygon"])
+        grid_gdf = gpd.read_file(artifacts["analysis_grid"])
+        buildings_path = Path(artifacts.get("buildings", ""))
+        buildings_gdf = gpd.read_file(buildings_path) if buildings_path.exists() else None
+        analysis_features_df = pd.read_csv(artifacts["analysis_grid_features"])
+        site_df = pd.read_csv(artifacts["site_df"])
+        site_df = _prepare_site_selection_df(site_df)
+        drive_df = pd.read_csv(artifacts["drive_df"])
+        pred_df = pd.read_parquet(artifacts["rf_prediction_grid"])
+        dt_eval = pd.read_csv(artifacts["rf_accuracy_points"])
+        st.subheader("Metric Comparison")
+        tabs = st.tabs(["RSRP", "RSRQ", "SINR"])
+        metric_names = ["RSRP_meas", "RSRQ_meas", "SINR_meas"]
+        for tab, metric_name in zip(tabs, metric_names):
+            with tab:
+                _render_metric_compare(summary, metric_name)
+                _render_metric_detail_table(summary, metric_name)
+
+        _render_range_summary(dt_eval)
+
+        st.subheader("RF Comparison Images")
+        image_tabs = st.tabs(["RSRP Images", "RSRQ Images", "SINR Images"])
+        for tab, metric_name in zip(image_tabs, ("RSRP", "RSRQ", "SINR")):
+            with tab:
+                st.markdown(f"**{metric_name}: Holdout DT vs Source RF Full Polygon**")
+                _render_signal_image(dt_eval, pred_df, metric_name)
+                _render_error_image(dt_eval, metric_name)
+
+        st.subheader("Validation Charts")
+        chart_tabs = st.tabs(["RSRP Charts", "RSRQ Charts", "SINR Charts"])
+        for tab, metric_name in zip(chart_tabs, ("RSRP", "RSRQ", "SINR")):
+            with tab:
+                _render_scatter_validation(dt_eval, metric_name)
+                _render_error_distribution(dt_eval, metric_name)
+
+        st.subheader("Maps")
+        map_control_cols = st.columns(4)
+        kpi_map_choice = map_control_cols[0].selectbox(
+            "RF KPI",
+            options=[
+                ("RSRP", "pred_rsrp"),
+                ("RSRQ", "pred_rsrq"),
+                ("SINR", "pred_sinr"),
+                ("RSRP Geo", "pred_rsrp_geo"),
+                ("RSRQ Geo", "pred_rsrq_geo"),
+                ("SINR Geo", "pred_sinr_geo"),
+            ],
+            format_func=lambda item: item[0],
+            index=0,
+        )[1]
+        selection_mode = map_control_cols[1].radio("Coverage Scope", options=["All", "Sector", "NodeB"], horizontal=True)
+        available_sectors = sorted(site_df["Node_Cell_ID"].dropna().astype(str).unique().tolist()) if "Node_Cell_ID" in site_df.columns else []
+        available_nodebs = (
+            sorted(
+                [
+                    value
+                    for value in site_df["dashboard_nodeb_id"].dropna().astype(str).unique().tolist()
+                    if value not in {"", "nan", "None"}
+                ]
+            )
+            if "dashboard_nodeb_id" in site_df.columns
+            else []
+        )
+        selected_sector = None
+        selected_nodeb = None
+        if selection_mode == "Sector" and available_sectors:
+            selected_sector = map_control_cols[2].selectbox("Sector", options=available_sectors, index=0)
+        elif selection_mode == "NodeB" and available_nodebs:
+            selected_nodeb = map_control_cols[2].selectbox("NodeB/Site", options=available_nodebs, index=0)
+        show_site_markers = map_control_cols[3].checkbox("Show Site Markers", value=True)
+
+        map_tabs = st.tabs(["RF Full Polygon", "Clutter Tiles", "Morphology Clusters"])
+        with map_tabs[0]:
+            _render_map(
+                _build_map(
+                    polygon_gdf,
+                    site_df,
+                    drive_df,
+                    pred_df,
+                    buildings_gdf,
+                    grid_gdf,
+                    show_geo=False,
+                    kpi_col=kpi_map_choice,
+                    selected_sector=selected_sector,
+                    selected_nodeb=selected_nodeb,
+                    show_site_markers=show_site_markers,
+                ),
+                "baseline_map",
+            )
+        with map_tabs[1]:
+            _render_map(
+                _build_map(
+                    polygon_gdf,
+                    site_df.iloc[:50],
+                    drive_df.iloc[:1],
+                    pred_df.iloc[:1],
+                    buildings_gdf,
+                    grid_gdf,
+                    show_geo=False,
+                    show_site_markers=show_site_markers,
+                ),
+                "clutter_map",
+            )
+        with map_tabs[2]:
+            _render_map(
+                _build_map(
+                    polygon_gdf,
+                    site_df.iloc[:50],
+                    drive_df.iloc[:1],
+                    pred_df.iloc[:1],
+                    buildings_gdf,
+                    grid_gdf,
+                    show_geo=True,
+                    show_site_markers=show_site_markers,
+                ),
+                "cluster_map",
             )
 
-    feature_diag = summary.get("feature_diagnostics", {})
-    if feature_diag:
-        st.markdown("**Feature Diagnostics**")
-        feature_diag_df = pd.DataFrame(
-            [{"feature": key, **value} for key, value in feature_diag.items()]
-        )
-        st.dataframe(feature_diag_df, use_container_width=True)
+        if {"RSRP_meas", "RSRP_pred"}.issubset(dt_eval.columns):
+            scatter = px.scatter(
+                dt_eval,
+                x="RSRP_meas",
+                y="RSRP_pred",
+                color="morphology_cluster" if "morphology_cluster" in dt_eval.columns else None,
+                title="Baseline RF: Measured vs Predicted RSRP",
+                opacity=0.65,
+            )
+            st.plotly_chart(scatter, use_container_width=True)
 
-    cluster_counts = summary.get("cluster_counts", {})
-    if cluster_counts:
-        st.markdown("**Cluster Counts**")
-        cluster_df = pd.DataFrame(
-            [{"morphology_cluster": key, "count": value} for key, value in cluster_counts.items()]
-        )
-        st.dataframe(cluster_df, use_container_width=True)
+        feature_candidates = [
+            "building_count",
+            "building_area_ratio",
+            "avg_building_area_m2",
+            "road_length_m",
+            "green_ratio",
+            "water_ratio",
+            "nearest_site_distance_m",
+            "mean_nearest3_site_distance_m",
+            "site_count_250m",
+            "site_count_500m",
+            "serving_distance_m",
+            "azimuth_delta_deg",
+            "clutter_class",
+            "morphology_cluster",
+        ]
+        available_features = [col for col in feature_candidates if col in analysis_features_df.columns]
+        if available_features:
+            st.subheader("Feature Visualization")
+            selected_feature = st.selectbox("Feature Parameter", available_features, index=0)
+            _render_feature_map(analysis_features_df, selected_feature)
 
-    experimental_model = summary.get("experimental_model", {})
-    if experimental_model:
-        st.markdown("**Experimental Model**")
-        experimental_df = pd.DataFrame(
-            [
-                {
-                    "metric": metric,
-                    "train_rows": info.get("train_rows"),
-                    "feature_count": info.get("feature_count"),
-                    "top_features": ", ".join(
-                        f"{name}={value}" for name, value in info.get("top_features", {}).items()
-                    ),
-                }
-                for metric, info in experimental_model.items()
-            ]
-        )
-        st.dataframe(experimental_df, use_container_width=True)
-
-    artifacts = summary["artifacts"]
-    polygon_gdf = gpd.read_file(artifacts["project_polygon"])
-    grid_gdf = gpd.read_file(artifacts["analysis_grid"])
-    buildings_path = Path(artifacts.get("buildings", ""))
-    buildings_gdf = gpd.read_file(buildings_path) if buildings_path.exists() else None
-    analysis_features_df = pd.read_csv(artifacts["analysis_grid_features"])
-    site_df = pd.read_csv(artifacts["site_df"])
-    site_df = _prepare_site_selection_df(site_df)
-    drive_df = pd.read_csv(artifacts["drive_df"])
-    pred_df = pd.read_parquet(artifacts["rf_prediction_grid"])
-    pred_map_df = pd.read_csv(artifacts["rf_prediction_grid_sample"])
-    dt_eval = pd.read_csv(artifacts["rf_accuracy_points"])
-    st.subheader("Metric Comparison")
-    tabs = st.tabs(["RSRP", "RSRQ", "SINR"])
-    metric_names = ["RSRP_meas", "RSRQ_meas", "SINR_meas"]
-    for tab, metric_name in zip(tabs, metric_names):
-        with tab:
-            _render_metric_compare(summary, metric_name)
-            _render_metric_detail_table(summary, metric_name)
-
-    _render_range_summary(dt_eval)
-
-    st.subheader("RF Comparison Images")
-    image_tabs = st.tabs(["RSRP Images", "RSRQ Images", "SINR Images"])
-    for tab, metric_name in zip(image_tabs, ("RSRP", "RSRQ", "SINR")):
-        with tab:
-            st.markdown(f"**{metric_name}: Holdout DT vs Source RF Full Polygon**")
-            _render_signal_image(dt_eval, pred_df, metric_name)
-            _render_error_image(dt_eval, metric_name)
-
-    st.subheader("Validation Charts")
-    chart_tabs = st.tabs(["RSRP Charts", "RSRQ Charts", "SINR Charts"])
-    for tab, metric_name in zip(chart_tabs, ("RSRP", "RSRQ", "SINR")):
-        with tab:
-            _render_scatter_validation(dt_eval, metric_name)
-            _render_error_distribution(dt_eval, metric_name)
-
-    st.subheader("Maps")
-    map_control_cols = st.columns(4)
-    kpi_map_choice = map_control_cols[0].selectbox(
-        "RF KPI",
-        options=[
-            ("RSRP", "pred_rsrp"),
-            ("RSRQ", "pred_rsrq"),
-            ("SINR", "pred_sinr"),
-            ("RSRP Geo", "pred_rsrp_geo"),
-            ("RSRQ Geo", "pred_rsrq_geo"),
-            ("SINR Geo", "pred_sinr_geo"),
-        ],
-        format_func=lambda item: item[0],
-        index=0,
-    )[1]
-    selection_mode = map_control_cols[1].radio("Coverage Scope", options=["All", "Sector", "NodeB"], horizontal=True)
-    available_sectors = sorted(site_df["Node_Cell_ID"].dropna().astype(str).unique().tolist()) if "Node_Cell_ID" in site_df.columns else []
-    available_nodebs = (
-        sorted(
-            [
-                value
-                for value in site_df["dashboard_nodeb_id"].dropna().astype(str).unique().tolist()
-                if value not in {"", "nan", "None"}
-            ]
-        )
-        if "dashboard_nodeb_id" in site_df.columns
-        else []
-    )
-    selected_sector = None
-    selected_nodeb = None
-    if selection_mode == "Sector" and available_sectors:
-        selected_sector = map_control_cols[2].selectbox("Sector", options=available_sectors, index=0)
-    elif selection_mode == "NodeB" and available_nodebs:
-        selected_nodeb = map_control_cols[2].selectbox("NodeB/Site", options=available_nodebs, index=0)
-    show_site_markers = map_control_cols[3].checkbox("Show Site Markers", value=True)
-
-    map_tabs = st.tabs(["RF Full Polygon", "Clutter Tiles", "Morphology Clusters"])
-    with map_tabs[0]:
-        _render_map(
-            _build_map(
-                polygon_gdf,
-                site_df,
-                drive_df,
-                pred_df,
-                buildings_gdf,
-                grid_gdf,
-                show_geo=False,
-                kpi_col=kpi_map_choice,
-                selected_sector=selected_sector,
-                selected_nodeb=selected_nodeb,
-                show_site_markers=show_site_markers,
-            ),
-            "baseline_map",
-        )
-    with map_tabs[1]:
-        _render_map(
-            _build_map(
-                polygon_gdf,
-                site_df.iloc[:50],
-                drive_df.iloc[:1],
-                pred_df.iloc[:1],
-                buildings_gdf,
-                grid_gdf,
-                show_geo=False,
-                show_site_markers=show_site_markers,
-            ),
-            "clutter_map",
-        )
-    with map_tabs[2]:
-        _render_map(
-            _build_map(
-                polygon_gdf,
-                site_df.iloc[:50],
-                drive_df.iloc[:1],
-                pred_df.iloc[:1],
-                buildings_gdf,
-                grid_gdf,
-                show_geo=True,
-                show_site_markers=show_site_markers,
-            ),
-            "cluster_map",
-        )
-
-    if {"RSRP_meas", "RSRP_pred"}.issubset(dt_eval.columns):
-        scatter = px.scatter(
-            dt_eval,
-            x="RSRP_meas",
-            y="RSRP_pred",
-            color="morphology_cluster" if "morphology_cluster" in dt_eval.columns else None,
-            title="Baseline RF: Measured vs Predicted RSRP",
-            opacity=0.65,
-        )
-        st.plotly_chart(scatter, use_container_width=True)
-
-    feature_candidates = [
-        "building_count",
-        "building_area_ratio",
-        "avg_building_area_m2",
-        "road_length_m",
-        "green_ratio",
-        "water_ratio",
-        "nearest_site_distance_m",
-        "mean_nearest3_site_distance_m",
-        "site_count_250m",
-        "site_count_500m",
-        "serving_distance_m",
-        "azimuth_delta_deg",
-        "clutter_class",
-        "morphology_cluster",
-    ]
-    available_features = [col for col in feature_candidates if col in analysis_features_df.columns]
-    if available_features:
-        st.subheader("Feature Visualization")
-        selected_feature = st.selectbox("Feature Parameter", available_features, index=0)
-        _render_feature_map(analysis_features_df, selected_feature)
-
-    st.subheader("Run Logs")
-    run_log_path = Path(artifacts["run_log"])
-    if run_log_path.exists():
-        st.text_area("Test Lab Log", run_log_path.read_text(encoding="utf-8", errors="ignore"), height=320)
-    rf_log_path = summary.get("rf_log_path")
-    if rf_log_path and Path(rf_log_path).exists():
-        st.text_area("Source RF Log", Path(rf_log_path).read_text(encoding="utf-8", errors="ignore"), height=320)
+        st.subheader("Run Logs")
+        run_log_path = Path(artifacts["run_log"])
+        if run_log_path.exists():
+            st.text_area("Test Lab Log", run_log_path.read_text(encoding="utf-8", errors="ignore"), height=320)
+        rf_log_path = summary.get("rf_log_path")
+        if rf_log_path and Path(rf_log_path).exists():
+            st.text_area("Source RF Log", Path(rf_log_path).read_text(encoding="utf-8", errors="ignore"), height=320)
 
 
 if __name__ == "__main__":

@@ -54,23 +54,56 @@ BAND_TO_FREQ = {
 
 _PREDICTION_POOL = None
 _PREDICTION_POOL_WORKERS = None
+_WORKER_SHARED_CONTEXT = None
+_WORKER_POLYGONS = None
+_WORKER_META = None
+
+
+def _context_signature(shared_context):
+    if not shared_context:
+        return None
+    polygons = shared_context.get("polygons")
+    meta = shared_context.get("meta")
+    return (
+        len(polygons) if polygons is not None else 0,
+        len(meta) if meta is not None else 0,
+    )
+
+
+def _init_prediction_worker(shared_context=None):
+    global _WORKER_SHARED_CONTEXT, _WORKER_POLYGONS, _WORKER_META
+    _WORKER_SHARED_CONTEXT = shared_context or {}
+    _WORKER_POLYGONS = _WORKER_SHARED_CONTEXT.get("polygons")
+    _WORKER_META = _WORKER_SHARED_CONTEXT.get("meta")
 
 
 def _close_prediction_pool():
-    global _PREDICTION_POOL, _PREDICTION_POOL_WORKERS
+    global _PREDICTION_POOL, _PREDICTION_POOL_WORKERS, _WORKER_SHARED_CONTEXT
     if _PREDICTION_POOL is not None:
         _PREDICTION_POOL.close()
         _PREDICTION_POOL.join()
         _PREDICTION_POOL = None
         _PREDICTION_POOL_WORKERS = None
+        _WORKER_SHARED_CONTEXT = None
 
 
-def get_prediction_pool(n_workers):
-    global _PREDICTION_POOL, _PREDICTION_POOL_WORKERS
-    if _PREDICTION_POOL is None or _PREDICTION_POOL_WORKERS != n_workers:
+def get_prediction_pool(n_workers, shared_context=None):
+    global _PREDICTION_POOL, _PREDICTION_POOL_WORKERS, _WORKER_SHARED_CONTEXT
+    shared_signature = _context_signature(shared_context)
+    current_signature = _context_signature(_WORKER_SHARED_CONTEXT)
+    if (
+        _PREDICTION_POOL is None
+        or _PREDICTION_POOL_WORKERS != n_workers
+        or shared_signature != current_signature
+    ):
         _close_prediction_pool()
-        _PREDICTION_POOL = mp.Pool(n_workers)
+        _PREDICTION_POOL = mp.Pool(
+            n_workers,
+            initializer=_init_prediction_worker,
+            initargs=(shared_context,),
+        )
         _PREDICTION_POOL_WORKERS = n_workers
+        _WORKER_SHARED_CONTEXT = shared_context or {}
         print(f"[LTE][POOL] initialized_shared_pool workers={n_workers}")
     return _PREDICTION_POOL
 
@@ -111,21 +144,21 @@ def select_nearest_site_rows(site_df, serving_site_rows, limit):
 
     clat = float(serving_site_rows["lat"].mean())
     clon = float(serving_site_rows["lon"].mean())
-
-    candidate_df = site_df.copy()
-    candidate_df["_distance_m"] = haversine_vectorized(
+    site_lat = site_df["lat"].to_numpy(dtype=float, copy=False)
+    site_lon = site_df["lon"].to_numpy(dtype=float, copy=False)
+    distances = haversine_vectorized(
         clat,
         clon,
-        candidate_df["lat"].astype(float).values,
-        candidate_df["lon"].astype(float).values
+        site_lat,
+        site_lon,
     )
-
-    nearest_df = candidate_df.nsmallest(limit, "_distance_m").drop(columns=["_distance_m"])
+    nearest_idx = np.argpartition(distances, min(limit, len(distances) - 1))[:limit]
+    nearest_df = site_df.iloc[nearest_idx]
 
     serving_ids = set(serving_site_rows["Node_Cell_ID"].astype(str))
-    serving_df = candidate_df[
-        candidate_df["Node_Cell_ID"].astype(str).isin(serving_ids)
-    ].drop(columns=["_distance_m"])
+    serving_df = site_df[
+        site_df["Node_Cell_ID"].astype(str).isin(serving_ids)
+    ]
 
     combined_df = (
         pd.concat([nearest_df, serving_df], ignore_index=True)
@@ -212,7 +245,7 @@ def process_chunk_3gpp_antenna(args):
 
     all_sites = params.get('all_sites_rows', serving_site_rows)
 
-    # 🔥 PRE-COMPUTE (VERY IMPORTANT)
+    #  PRE-COMPUTE (VERY IMPORTANT)
     sites_array = all_sites   # already a list
     serving_ids = set(serving_site_rows['Node_Cell_ID'].astype(str))
 
@@ -346,7 +379,7 @@ def load_building_polygons(path):
             geom_col = candidate
             break
     if geom_col is None:
-        raise ValueError("❌ No supported geometry column found in building CSV")
+        raise ValueError(" No supported geometry column found in building CSV")
 
     polygons = []
     meta     = []
@@ -402,16 +435,31 @@ def load_building_polygons(path):
             continue
 
         polygons.append(poly)
-        meta.append({"loss": 15.0})
+        minx, miny, maxx, maxy = poly.bounds
+        meta.append({
+            "loss": 15.0,
+            "min_lon": float(minx),
+            "min_lat": float(miny),
+            "max_lon": float(maxx),
+            "max_lat": float(maxy),
+        })
 
     print(f"✔ Loaded {len(polygons)} building polygons (skipped {skipped})")
     return polygons, meta
 
 def detect_indoor(lat, lon, polygons, meta):
     if polygons is None:
+        polygons = _WORKER_POLYGONS
+        meta = _WORKER_META
+    if polygons is None:
         return 0
     pt = Point(lon, lat)
     for poly, m in zip(polygons, meta):
+        if not (
+            m["min_lon"] <= lon <= m["max_lon"]
+            and m["min_lat"] <= lat <= m["max_lat"]
+        ):
+            continue
         if poly.contains(pt):
             return m["loss"]
     return 0
@@ -502,9 +550,7 @@ def generate_grid(site_rows, radius_m=5000, res=25):
     latf = LAT.flatten()
     lonf = LON.flatten()
 
-    d = np.zeros(len(latf))
-    for i in range(len(latf)):
-        d[i] = haversine_vectorized(clat, clon, latf[i], lonf[i])
+    d = haversine_vectorized(clat, clon, latf, lonf)
     mask = d <= radius_m
 
     df = pd.DataFrame({"lat": latf[mask], "lon": lonf[mask]})
@@ -524,7 +570,7 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
     if n_workers is None or n_workers < 1:
         n_workers = max(1, mp.cpu_count() - 1)
 
-    print(f"🚀 Using {n_workers} CPU cores for {len(test_pts)} points")
+    print(f" Using {n_workers} CPU cores for {len(test_pts)} points")
 
     print(
         f"[LTE][PATHLOSS] serving_rows={len(serving_site_rows)} "
@@ -534,22 +580,32 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
     )
     total_points = len(test_pts)
 
-    # 🔥 SMART CHUNKING
+    #  SMART CHUNKING
     chunk_divisor = max(1, n_workers * 2)
     chunk_size = max(25, math.ceil(total_points / chunk_divisor))
     print(f"[LTE][PATHLOSS] total_points={total_points} chunk_size={chunk_size}")
 
     chunks = []
+    if pool is not None or use_shared_pool:
+        chunk_params = {k: v for k, v in params.items() if k not in ("polygons", "meta")}
+    else:
+        chunk_params = params
     for i in range(0, total_points, chunk_size):
         sub = test_pts.iloc[i:i+chunk_size]
         rows = sub.to_dict("records")
-        chunks.append((rows, serving_site_rows, params))
+        chunks.append((rows, serving_site_rows, chunk_params))
 
     all_rsrp, all_rsrq, all_sinr = [], [], []
 
-    # 🔥 FAST MULTIPROCESSING
+    #  FAST MULTIPROCESSING
     if pool is None and use_shared_pool:
-        pool = get_prediction_pool(n_workers)
+        pool = get_prediction_pool(
+            n_workers,
+            shared_context={
+                "polygons": params.get("polygons"),
+                "meta": params.get("meta"),
+            },
+        )
 
     if pool is None:
         with mp.Pool(n_workers) as local_pool:
@@ -607,7 +663,7 @@ def generate_accuracy_report(drive_df, site_df, params, pool=None):
     )
 
     # RSRP
-    print(f"\n✅ RSRP ACCURACY:")
+    print(f"\n RSRP ACCURACY:")
     print(f"   MAE  : {mean_absolute_error(dt['RSRP_meas'], dt['RSRP_pred']):.2f} dB")
     print(f"   RMSE : {np.sqrt(mean_squared_error(dt['RSRP_meas'], dt['RSRP_pred'])):.2f} dB")
     print(f"   R2   : {r2_score(dt['RSRP_meas'], dt['RSRP_pred']):.4f}")
@@ -617,7 +673,7 @@ def generate_accuracy_report(drive_df, site_df, params, pool=None):
         dt["RSRQ_meas"] = pd.to_numeric(dt[qcol], errors="coerce")
         vq = dt.dropna(subset=["RSRQ_meas", "RSRQ_pred"])
         if len(vq) > 0:
-            print(f"\n✅ RSRQ ACCURACY:")
+            print(f"\n RSRQ ACCURACY:")
             print(f"   MAE  : {mean_absolute_error(vq['RSRQ_meas'], vq['RSRQ_pred']):.2f} dB")
             print(f"   RMSE : {np.sqrt(mean_squared_error(vq['RSRQ_meas'], vq['RSRQ_pred'])):.2f} dB")
             print(f"   R2   : {r2_score(vq['RSRQ_meas'], vq['RSRQ_pred']):.4f}")
@@ -629,7 +685,7 @@ def generate_accuracy_report(drive_df, site_df, params, pool=None):
         dt["SINR_meas"] = pd.to_numeric(dt[scol], errors="coerce")
         vs = dt.dropna(subset=["SINR_meas", "SINR_pred"])
         if len(vs) > 0:
-            print(f"\n✅ SINR ACCURACY:")
+            print(f"\n SINR ACCURACY:")
             print(f"   MAE  : {mean_absolute_error(vs['SINR_meas'], vs['SINR_pred']):.2f} dB")
             print(f"   RMSE : {np.sqrt(mean_squared_error(vs['SINR_meas'], vs['SINR_pred'])):.2f} dB")
             print(f"   R2   : {r2_score(vs['SINR_meas'], vs['SINR_pred']):.4f}")
@@ -659,7 +715,7 @@ def main(args):
     site_df = standardize_latlon(normcols(site_df))
 
     if "cell_id" not in site_df.columns:
-        raise ValueError("❌ 'cell_id' column missing in site file.")
+        raise ValueError(" 'cell_id' column missing in site file.")
 
     site_df["Node_Cell_ID"] = site_df["cell_id"].astype(str)
     site_df = site_df.rename(columns={
@@ -703,7 +759,7 @@ def main(args):
     max_interference_sites = int(getattr(args, "max_interference_sites", 50))
 
     if args.calibrate and drive_df is not None:
-        print("📌 Calibrating K1/K2 from drive-test data...")
+        print(" Calibrating K1/K2 from drive-test data...")
         total_calibration_cells = len(unique_cells)
         calibrated_count = 0
         skipped_count = 0
@@ -755,7 +811,7 @@ def main(args):
                     f"status=skipped reason=missing_dt_for_cell"
                 )
 
-        print(f"   ✔ {len(calibrated_params)} cells calibrated from DT.\n")
+        print(f"    {len(calibrated_params)} cells calibrated from DT.\n")
 
     # ── 6. RUN CELL-WISE PREDICTION ─────────────────────────────
     final_list = []
@@ -786,7 +842,7 @@ def main(args):
         if args.calibrate and drive_df is not None:
             if cid in calibrated_params:
                 k1, k2, _, _ = calibrated_params[cid]
-                print(f"   ✔ Calibrated K1={k1:.2f}  K2={k2:.2f}")
+                print(f"    Calibrated K1={k1:.2f}  K2={k2:.2f}")
             elif len(calibrated_params) > 0:
                 clat = site_rows["lat"].mean()
                 clon = site_rows["lon"].mean()
@@ -800,15 +856,15 @@ def main(args):
                     clat, clon,
                     calibrated_params[closest_cid][2],
                     calibrated_params[closest_cid][3]) / 1000.0
-                print(f"   ⚠ Inheriting K1={k1:.2f} K2={k2:.2f} from {dist_km:.2f} km away.")
+                print(f"     Inheriting K1={k1:.2f} K2={k2:.2f} from {dist_km:.2f} km away.")
             else:
                 # FIX #4 ── default = 0,0 → use COST-231 formula (was 135/169, 35.2)
                 k1, k2 = 0, 0
-                print(f"   ⚠ No reference cells. Using COST-231 default formula.")
+                print(f"     No reference cells. Using COST-231 default formula.")
         else:
             # FIX #4 ── non-calibrate mode: also use COST-231 (was 169, 35.2)
             k1, k2 = 0, 0
-            print(f"   ℹ Non-calibrate mode: using COST-231 formula.")
+            print(f"   Non-calibrate mode: using COST-231 formula.")
 
         # ── Build params dict ──
         params = {
@@ -825,7 +881,7 @@ def main(args):
         }
 
         pts = generate_grid(site_rows, args.radius, args.grid_resolution)
-        print(f"✔ Grid points: {len(pts)}")
+        print(f" Grid points: {len(pts)}")
 
         rsrp, rsrq, sinr = compute_predictions_parallel(
             pts, site_rows, params, n_workers=args.n_workers, use_shared_pool=True
@@ -876,7 +932,7 @@ def main(args):
     final_df.to_csv(outfile, index=False)
 
     print("\n============================================================")
-    print(" 🎉 FINAL OUTPUT SAVED TO:")
+    print("  FINAL OUTPUT SAVED TO:")
     print(" ", outfile)
     print("============================================================")
 

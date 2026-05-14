@@ -58,6 +58,20 @@ outputs/
 data/
 data/reports/
 tests/output/
+tests/output/project_*/
+tests/output/**/RF_Optimization_Report*.xlsx
+tests/output/**/recommendations*.csv
+tests/output/**/forecast*.csv
+tests/output/**/bad_*.csv
+tests/output/**/geo_features_input.csv
+tests/output/**/antenna_input.csv
+tests/output/**/baseline_log_input.csv
+tests/output/**/dominant_bearing_summary.csv
+tests/output/**/summary.json
+
+# Local API / run scratch files
+commands.local.txt
+commands.*.local.txt
 
 # Local reports / exports / archives
 *.csv

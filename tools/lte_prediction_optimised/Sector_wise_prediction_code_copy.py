@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import atexit
 import math
 import os
 import time
@@ -45,6 +46,31 @@ KPI_RANGES = {
     "RSRQ": (-20, -3),
     "SINR": (-10, 30),
 }
+
+_PREDICTION_POOL = None
+_PREDICTION_POOL_WORKERS = None
+
+
+def _close_prediction_pool():
+    global _PREDICTION_POOL, _PREDICTION_POOL_WORKERS
+    if _PREDICTION_POOL is not None:
+        _PREDICTION_POOL.close()
+        _PREDICTION_POOL.join()
+        _PREDICTION_POOL = None
+        _PREDICTION_POOL_WORKERS = None
+
+
+def get_prediction_pool(n_workers):
+    global _PREDICTION_POOL, _PREDICTION_POOL_WORKERS
+    if _PREDICTION_POOL is None or _PREDICTION_POOL_WORKERS != n_workers:
+        _close_prediction_pool()
+        _PREDICTION_POOL = mp.Pool(n_workers)
+        _PREDICTION_POOL_WORKERS = n_workers
+        print(f"[LTE_OPT][POOL] initialized_shared_pool workers={n_workers}")
+    return _PREDICTION_POOL
+
+
+atexit.register(_close_prediction_pool)
 
 BAND_TO_FREQ = {
     1: 2100, 3: 1800, 5: 850,
@@ -152,7 +178,7 @@ def process_chunk_3gpp_antenna(args):
 
     all_sites = params.get('all_sites_rows', serving_site_rows)
 
-    # 🔥 PRE-COMPUTE (VERY IMPORTANT)
+    #  PRE-COMPUTE (VERY IMPORTANT)
     sites_array = all_sites   # already a list
     serving_ids = set(serving_site_rows['Node_Cell_ID'].astype(str))
 
@@ -281,7 +307,7 @@ def load_building_polygons(path):
     df.columns = [c.strip().lower() for c in df.columns]
 
     if "region" not in df.columns:
-        raise ValueError("❌ Column 'region' not found in building CSV")
+        raise ValueError(" Column 'region' not found in building CSV")
 
     polygons = []
     meta     = []
@@ -322,7 +348,7 @@ def load_building_polygons(path):
         except:
             skipped += 1
 
-    print(f"✔ Loaded {len(polygons)} building polygons (skipped {skipped})")
+    print(f" Loaded {len(polygons)} building polygons (skipped {skipped})")
     return polygons, meta
 
 def detect_indoor(lat, lon, polygons, meta):
@@ -420,9 +446,12 @@ def generate_grid(site_rows, radius_m=5000, res=25):
     latf = LAT.flatten()
     lonf = LON.flatten()
 
-    d = np.zeros(len(latf))
-    for i in range(len(latf)):
-        d[i] = haversine_vectorized(clat, clon, latf[i], lonf[i])
+    d = haversine_vectorized(
+        clat,
+        clon,
+        latf,
+        lonf,
+    )
     mask = d <= radius_m
 
     df = pd.DataFrame({"lat": latf[mask], "lon": lonf[mask]})
@@ -439,10 +468,24 @@ def generate_grid(site_rows, radius_m=5000, res=25):
 
 def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=None):
 
+    requested_workers = n_workers
     if n_workers is None or n_workers < 1:
-        n_workers = max(1, mp.cpu_count() - 1)
+        requested_workers = max(1, mp.cpu_count() - 1)
+    total_points = len(test_pts)
+    if total_points <= 900:
+        effective_workers = 1
+    elif total_points <= 1800:
+        effective_workers = min(2, requested_workers)
+    else:
+        effective_workers = min(3, requested_workers)
 
-    print(f"🚀 Using {n_workers} CPU cores for {len(test_pts)} points")
+    print(
+        f" Using {effective_workers} CPU cores for {len(test_pts)} points"
+    )
+    print(
+        f"[LTE_OPT][POOL] requested_workers={requested_workers} "
+        f"effective_workers={effective_workers} total_points={total_points}"
+    )
 
     print(
         f"[LTE_OPT][PATHLOSS] serving_rows={len(serving_site_rows)} "
@@ -450,10 +493,9 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
         f"freq_mhz={params.get('frequency_mhz')} bandwidth_mhz={params.get('bandwidth_mhz')} "
         f"k1={params.get('k1')} k2={params.get('k2')}"
     )
-    total_points = len(test_pts)
 
-    # 🔥 SMART CHUNKING
-    chunk_size = max(1000, total_points // (n_workers * 2))
+    #  SMART CHUNKING
+    chunk_size = max(1000, total_points // max(1, effective_workers * 2))
     print(f"[LTE_OPT][PATHLOSS] total_points={total_points} chunk_size={chunk_size}")
 
     chunks = []
@@ -464,8 +506,11 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
 
     all_rsrp, all_rsrq, all_sinr = [], [], []
 
-    # 🔥 FAST MULTIPROCESSING
-    with mp.Pool(n_workers) as pool:
+    #  FAST MULTIPROCESSING
+    if effective_workers == 1:
+        results = list(map(process_chunk_3gpp_antenna, chunks))
+    else:
+        pool = get_prediction_pool(effective_workers)
         results = pool.map(process_chunk_3gpp_antenna, chunks)
 
     for r, q, s in results:
@@ -518,7 +563,7 @@ def generate_accuracy_report(drive_df, site_df, params):
     )
 
     # RSRP
-    print(f"\n✅ RSRP ACCURACY:")
+    print(f"\n RSRP ACCURACY:")
     print(f"   MAE  : {mean_absolute_error(dt['RSRP_meas'], dt['RSRP_pred']):.2f} dB")
     print(f"   RMSE : {np.sqrt(mean_squared_error(dt['RSRP_meas'], dt['RSRP_pred'])):.2f} dB")
     print(f"   R2   : {r2_score(dt['RSRP_meas'], dt['RSRP_pred']):.4f}")
@@ -528,7 +573,7 @@ def generate_accuracy_report(drive_df, site_df, params):
         dt["RSRQ_meas"] = pd.to_numeric(dt[qcol], errors="coerce")
         vq = dt.dropna(subset=["RSRQ_meas", "RSRQ_pred"])
         if len(vq) > 0:
-            print(f"\n✅ RSRQ ACCURACY:")
+            print(f"\n RSRQ ACCURACY:")
             print(f"   MAE  : {mean_absolute_error(vq['RSRQ_meas'], vq['RSRQ_pred']):.2f} dB")
             print(f"   RMSE : {np.sqrt(mean_squared_error(vq['RSRQ_meas'], vq['RSRQ_pred'])):.2f} dB")
             print(f"   R2   : {r2_score(vq['RSRQ_meas'], vq['RSRQ_pred']):.4f}")
@@ -540,7 +585,7 @@ def generate_accuracy_report(drive_df, site_df, params):
         dt["SINR_meas"] = pd.to_numeric(dt[scol], errors="coerce")
         vs = dt.dropna(subset=["SINR_meas", "SINR_pred"])
         if len(vs) > 0:
-            print(f"\n✅ SINR ACCURACY:")
+            print(f"\n SINR ACCURACY:")
             print(f"   MAE  : {mean_absolute_error(vs['SINR_meas'], vs['SINR_pred']):.2f} dB")
             print(f"   RMSE : {np.sqrt(mean_squared_error(vs['SINR_meas'], vs['SINR_pred'])):.2f} dB")
             print(f"   R2   : {r2_score(vs['SINR_meas'], vs['SINR_pred']):.4f}")
@@ -570,7 +615,7 @@ def main(args):
     site_df = standardize_latlon(normcols(site_df))
 
     if "cell_id" not in site_df.columns:
-        raise ValueError("❌ 'cell_id' column missing in site file.")
+        raise ValueError(" 'cell_id' column missing in site file.")
 
     site_df["Node_Cell_ID"] = site_df["cell_id"].astype(str)
     site_df = site_df.rename(columns={
@@ -609,7 +654,7 @@ def main(args):
     site_df_records = site_df.to_dict('records')
 
     if args.calibrate and drive_df is not None:
-        print("📌 Calibrating K1/K2 from drive-test data...")
+        print(" Calibrating K1/K2 from drive-test data...")
         for cid in unique_cells:
             site_rows_tmp = site_df[site_df["Node_Cell_ID"] == cid].copy()
             cell_dt_tmp   = (drive_df[drive_df["Node_Cell_ID"] == cid].copy()
@@ -631,7 +676,7 @@ def main(args):
                     clon = site_rows_tmp["lon"].mean()
                     calibrated_params[cid] = (k1_tmp, k2_tmp, clat, clon)
 
-        print(f"   ✔ {len(calibrated_params)} cells calibrated from DT.\n")
+        print(f"    {len(calibrated_params)} cells calibrated from DT.\n")
 
     # ── 6. RUN CELL-WISE PREDICTION ─────────────────────────────
     final_list = []
@@ -648,7 +693,7 @@ def main(args):
 
             if cid in calibrated_params:
                 k1, k2, _, _ = calibrated_params[cid]
-                print(f"   ✔ Calibrated K1={k1:.2f}  K2={k2:.2f}")
+                print(f"    Calibrated K1={k1:.2f}  K2={k2:.2f}")
 
             elif len(calibrated_params) > 0:
                 clat = site_rows["lat"].mean()
@@ -665,27 +710,27 @@ def main(args):
 
                 k1, k2 = calibrated_params[closest_cid][:2]
 
-                print(f"   ⚠ Inherited K1={k1:.2f} K2={k2:.2f}")
+                print(f"    Inherited K1={k1:.2f} K2={k2:.2f}")
 
-        # 🔥 NEW: CELL-WISE K1/K2 FROM API
+        #  NEW: CELL-WISE K1/K2 FROM API
         elif hasattr(args, "k1k2_map") and args.k1k2_map:
 
             if cid in args.k1k2_map:
                 k1, k2 = args.k1k2_map[cid]
-                print(f"   ✔ API K1={k1:.2f} K2={k2:.2f}")
+                print(f"    API K1={k1:.2f} K2={k2:.2f}")
 
             else:
                 k1, k2 = 0, 0
-                print(f"   ⚠ No K1/K2 for {cid}, using COST231")
+                print(f"    No K1/K2 for {cid}, using COST231")
 
         # 🔥 OPTIONAL GLOBAL FALLBACK
         elif args.k1 is not None and args.k2 is not None:
             k1, k2 = args.k1, args.k2
-            print(f"   ✔ Global K1={k1:.2f} K2={k2:.2f}")
+            print(f"    Global K1={k1:.2f} K2={k2:.2f}")
 
         else:
             k1, k2 = 0, 0
-            print(f"   ℹ Using COST-231 default")
+            print(f"    Using COST-231 default")
 
         # ── Build params dict ──
         params = {
@@ -702,7 +747,7 @@ def main(args):
         }
 
         pts = generate_grid(site_rows, args.radius, args.grid_resolution)
-        print(f"✔ Grid points: {len(pts)}")
+        print(f" Grid points: {len(pts)}")
 
         rsrp, rsrq, sinr = compute_predictions_parallel(
             pts, site_rows, params, n_workers=args.n_workers
@@ -748,7 +793,7 @@ def main(args):
     final_df.to_csv(outfile, index=False)
 
     print("\n============================================================")
-    print(" 🎉 FINAL OUTPUT SAVED TO:")
+    print("  FINAL OUTPUT SAVED TO:")
     print(" ", outfile)
     print("============================================================")
 
@@ -759,11 +804,11 @@ def run_prediction_from_api(params):
 
     args = Args()
 
-    # 🔥 assign all params
+    #  assign all params
     for k, v in params.items():
         setattr(args, k, v)
 
-    # 🔥 IMPORTANT: ensure k1k2_map exists
+    #  IMPORTANT: ensure k1k2_map exists
     if not hasattr(args, "k1k2_map"):
         args.k1k2_map = None
 

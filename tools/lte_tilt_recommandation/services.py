@@ -10,6 +10,75 @@ from sqlalchemy import create_engine, text
 JOBS = {}
 
 
+def _clean_id_series(series: pd.Series) -> pd.Series:
+    out = series.astype(str).str.strip()
+    return out.str[:-2].where(out.str.endswith(".0"), out)
+
+
+def _build_node_cell_id(nodeb_series: pd.Series, cell_series: pd.Series) -> pd.Series:
+    nodeb = _clean_id_series(nodeb_series)
+    cell = _clean_id_series(cell_series)
+    return (nodeb + "_" + cell).str.strip("_")
+
+
+def _prepare_tilt_antenna_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
+    out = antenna_df.copy()
+    if "Node_Cell_ID" not in out.columns and {"nodeb_id", "cell_id"}.issubset(out.columns):
+        out["Node_Cell_ID"] = _build_node_cell_id(out["nodeb_id"], out["cell_id"])
+    if "lat" not in out.columns and "latitude" in out.columns:
+        out["lat"] = out["latitude"]
+    if "lon" not in out.columns and "longitude" in out.columns:
+        out["lon"] = out["longitude"]
+    if "electrical_tilt" not in out.columns and "e_tilt" in out.columns:
+        out["electrical_tilt"] = out["e_tilt"]
+    if "mechanical_tilt" not in out.columns and "m_tilt" in out.columns:
+        out["mechanical_tilt"] = out["m_tilt"]
+    if "antenna_height" not in out.columns and "height" in out.columns:
+        out["antenna_height"] = out["height"]
+    if "dashboard_site_id" not in out.columns and "nodeb_id" in out.columns:
+        out["dashboard_site_id"] = _clean_id_series(out["nodeb_id"])
+    return out
+
+
+def _prepare_tilt_log_df(log_df: pd.DataFrame, antenna_df: pd.DataFrame) -> pd.DataFrame:
+    out = log_df.copy()
+    if "node_b_id" in out.columns and "nodeb_id" not in out.columns:
+        out["nodeb_id"] = _clean_id_series(out["node_b_id"])
+    elif "nodeb_id" in out.columns:
+        out["nodeb_id"] = _clean_id_series(out["nodeb_id"])
+    if "cell_id" in out.columns:
+        out["cell_id"] = _clean_id_series(out["cell_id"])
+        out["local_cell_id"] = out["cell_id"]
+    if {"nodeb_id", "cell_id"}.issubset(out.columns):
+        out["Node_Cell_ID"] = _build_node_cell_id(out["nodeb_id"], out["cell_id"])
+
+    if "Node_Cell_ID" in antenna_df.columns:
+        ant = antenna_df.copy()
+        ant["Node_Cell_ID"] = ant["Node_Cell_ID"].astype(str).str.strip()
+        merge_cols = [
+            col for col in [
+                "Node_Cell_ID",
+                "Technology",
+                "lat",
+                "lon",
+                "azimuth",
+                "electrical_tilt",
+                "mechanical_tilt",
+                "tx_power",
+                "antenna_height",
+                "dashboard_site_id",
+            ] if col in ant.columns
+        ]
+        if merge_cols:
+            ant = ant[merge_cols].drop_duplicates(subset=["Node_Cell_ID"], keep="last")
+            out = out.merge(ant, on="Node_Cell_ID", how="left", suffixes=("", "_site"))
+    if "Technology" not in out.columns:
+        out["Technology"] = "4G"
+    else:
+        out["Technology"] = out["Technology"].fillna("4G")
+    return out
+
+
 def _safe_nunique(df, col):
     return int(df[col].nunique(dropna=True)) if col in df.columns else "n/a"
 
@@ -106,6 +175,7 @@ class RFOptimizationService:
             ant_query = text("SELECT * FROM site_prediction WHERE tbl_project_id = :pid")
             with current_engine.connect() as conn:
                 antenna_df = pd.read_sql(ant_query, conn, params={"pid": project_id})
+            antenna_df = _prepare_tilt_antenna_df(antenna_df)
             _log_df("ANTENNA_FETCH", antenna_df)
 
             # ==========================================
@@ -134,6 +204,7 @@ class RFOptimizationService:
             
             log_df = pd.concat(log_dfs, ignore_index=True)
             del log_dfs # Free up memory
+            log_df = _prepare_tilt_log_df(log_df, antenna_df)
             _log_df("BASELINE_FETCH_COMBINED", log_df)
 
             # ==========================================
@@ -141,13 +212,9 @@ class RFOptimizationService:
             # ==========================================
             self._update(job_id, "running", "Processing optimization script...")
 
-            def clean_id(val):
-                s = str(val).strip()
-                return s[:-2] if s.endswith(".0") else s
-
             log_df["clean_key"] = (
-                log_df["node_b_id"].apply(clean_id) + "_" + 
-                log_df["cell_id"].apply(clean_id)
+                _clean_id_series(log_df["node_b_id"]) + "_" +
+                _clean_id_series(log_df["cell_id"])
             )
             operator_map = log_df.drop_duplicates("clean_key").set_index("clean_key")["operator"].to_dict()
             print(f"[TILT][OPERATOR_MAP] mapped_keys={len(operator_map)}")
@@ -162,21 +229,64 @@ class RFOptimizationService:
 
             log_csv = os.path.join(temp_dir, "input_log.csv")
             ant_csv = os.path.join(temp_dir, "input_ant.csv")
+            geo_csv = os.path.join(temp_dir, "input_geo.csv")
             
             log_df_script = log_df.rename(columns={
-                "pred_rsrp": "rsrp", "pred_rsrq": "rsrq", 
-                "pred_sinr": "sinr", "node_b_id": "nodeb_id"
+                "pred_rsrp": "rsrp", "pred_rsrq": "rsrq",
+                "pred_sinr": "sinr",
             })
             
             # Fast disk writing
             log_df_script.to_csv(log_csv, index=False, chunksize=50000)
             antenna_df.to_csv(ant_csv, index=False)
 
+            self._update(job_id, "running", "Fetching geo-feature rows...")
+            geo_query = text(
+                """
+                SELECT
+                    lat,
+                    lon,
+                    nodeb_id_cell_id,
+                    clutter_class,
+                    morphology_cluster,
+                    building_count,
+                    building_area_ratio,
+                    avg_building_area_m2,
+                    road_length_m,
+                    green_ratio,
+                    water_ratio,
+                    los_blocker_count,
+                    los_blocked_ratio,
+                    max_blocker_height_m,
+                    diffraction_proxy_db,
+                    nlos_flag,
+                    terrain_elevation_m,
+                    terrain_slope_deg,
+                    proxy_site_elevation_m,
+                    terrain_relief_to_site_m,
+                    site_count_250m,
+                    site_count_500m,
+                    serving_distance_m,
+                    nearest_site_distance_m,
+                    mean_nearest3_site_distance_m,
+                    azimuth_delta_deg
+                FROM lte_prediction_geo_features
+                WHERE project_id = :pid
+                  AND region = :region
+                """
+            )
+            with current_engine.connect() as conn:
+                geo_df = pd.read_sql(geo_query, conn, params={"pid": project_id, "region": region})
+            if "nodeb_id_cell_id" in geo_df.columns:
+                geo_df["Node_Cell_ID"] = geo_df["nodeb_id_cell_id"].astype(str).str.strip()
+            geo_df.to_csv(geo_csv, index=False)
+            _log_df("GEO_FETCH", geo_df)
+
             scenario_id = self._get_next_scenario_id(project_id, current_engine)
             script_path = os.path.normpath(os.path.join(current_dir, "etilt_optimizer_cd2.py"))
             
             process = subprocess.run(
-                ["python", script_path, log_csv, ant_csv, r_thresh, q_thresh, s_thresh],
+                ["python", script_path, log_csv, ant_csv, r_thresh, q_thresh, s_thresh, geo_csv],
                 capture_output=True, text=True
             )
             if process.stdout:

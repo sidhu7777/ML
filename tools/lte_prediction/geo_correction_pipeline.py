@@ -23,6 +23,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     rasterio = None
 
+try:
+    import osmnx as ox
+except Exception:  # pragma: no cover - optional dependency
+    ox = None
+
 
 DEFAULT_TILE_SIZE_M = 100.0
 DEFAULT_CLUSTER_COUNT = 5
@@ -509,12 +514,12 @@ def create_analysis_grid(mask_gdf: gpd.GeoDataFrame, cell_size_m: float) -> gpd.
 
 def attach_building_features(grid_gdf: gpd.GeoDataFrame, building_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     grid_utm = grid_gdf.to_crs(_choose_utm_crs(grid_gdf))
-    grid_utm["building_count"] = 0
+    grid_utm["building_count"] = 0.0
     grid_utm["building_area_sum_m2"] = 0.0
+    grid_utm["avg_building_area_m2"] = 0.0
 
     if building_gdf.empty:
         grid_utm["building_area_ratio"] = 0.0
-        grid_utm["avg_building_area_m2"] = 0.0
         return grid_utm.to_crs("EPSG:4326")
 
     bld_utm = building_gdf.to_crs(grid_utm.crs).copy()
@@ -532,12 +537,24 @@ def attach_building_features(grid_gdf: gpd.GeoDataFrame, building_gdf: gpd.GeoDa
         building_area_sum_m2=("building_area_m2", "sum"),
         avg_building_area_m2=("building_area_m2", "mean"),
     )
-    grid_utm = grid_utm.merge(agg, on="grid_id", how="left", suffixes=("", "_agg"))
-    for col in ("building_count", "building_area_sum_m2", "avg_building_area_m2"):
-        grid_utm[col] = grid_utm[col].fillna(0)
+    agg = agg.rename(
+        columns={
+            "building_count": "building_count_calc",
+            "building_area_sum_m2": "building_area_sum_m2_calc",
+            "avg_building_area_m2": "avg_building_area_m2_calc",
+        }
+    )
+    grid_utm = grid_utm.merge(agg, on="grid_id", how="left")
+    grid_utm["building_count"] = pd.to_numeric(grid_utm["building_count_calc"], errors="coerce").fillna(0.0)
+    grid_utm["building_area_sum_m2"] = pd.to_numeric(grid_utm["building_area_sum_m2_calc"], errors="coerce").fillna(0.0)
+    grid_utm["avg_building_area_m2"] = pd.to_numeric(grid_utm["avg_building_area_m2_calc"], errors="coerce").fillna(0.0)
     grid_utm["building_area_ratio"] = (
         grid_utm["building_area_sum_m2"] / grid_utm["cell_area_m2"].replace(0, np.nan)
     ).fillna(0)
+    grid_utm = grid_utm.drop(
+        columns=["building_count_calc", "building_area_sum_m2_calc", "avg_building_area_m2_calc"],
+        errors="ignore",
+    )
     return grid_utm.to_crs("EPSG:4326")
 
 
@@ -588,6 +605,150 @@ def _fit_morphology_clusters(grid_df: pd.DataFrame, cluster_count: int) -> pd.Da
     model = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
     work["morphology_cluster"] = model.fit_predict(X)
     return work
+
+
+def _fetch_osm_features(mask_gdf: gpd.GeoDataFrame, tags: Dict[str, object]) -> gpd.GeoDataFrame:
+    if ox is None or mask_gdf.empty:
+        return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs="EPSG:4326")
+    try:
+        polygon = mask_gdf.to_crs("EPSG:4326").geometry.union_all()
+        features = ox.features_from_polygon(polygon, tags=tags)
+        if features is None or len(features) == 0:
+            return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs="EPSG:4326")
+        if not isinstance(features, gpd.GeoDataFrame):
+            features = gpd.GeoDataFrame(features, geometry="geometry", crs="EPSG:4326")
+        if features.crs is None:
+            features = features.set_crs("EPSG:4326")
+        else:
+            features = features.to_crs("EPSG:4326")
+        features = features[features.geometry.notnull() & ~features.geometry.is_empty].copy()
+        return features
+    except Exception as exc:
+        print(f"[LTE][OSM_FETCH] tags={tags} failed={exc}")
+        return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs="EPSG:4326")
+
+
+def _attach_osm_context_features(grid_gdf: gpd.GeoDataFrame, mask_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    out = grid_gdf.copy()
+    for col in ["road_length_m", "green_ratio", "water_ratio"]:
+        if col not in out.columns:
+            out[col] = 0.0
+
+    if mask_gdf.empty:
+        return out
+
+    grid_utm = out.to_crs(_choose_utm_crs(out))
+    mask_wgs84 = mask_gdf.to_crs("EPSG:4326")
+
+    road_tags = {"highway": True}
+    green_tags = {"landuse": ["forest", "grass", "meadow", "recreation_ground", "village_green"], "natural": ["wood", "grassland", "scrub"], "leisure": ["park", "garden", "nature_reserve", "pitch"]}
+    water_tags = {"natural": ["water", "wetland"], "waterway": True, "landuse": ["reservoir", "basin"], "leisure": ["swimming_pool"]}
+
+    roads = _fetch_osm_features(mask_wgs84, road_tags)
+    green = _fetch_osm_features(mask_wgs84, green_tags)
+    water = _fetch_osm_features(mask_wgs84, water_tags)
+
+    if not roads.empty:
+        roads = roads[roads.geometry.type.isin(["LineString", "MultiLineString"])].to_crs(grid_utm.crs).copy()
+        if not roads.empty:
+            road_join = gpd.overlay(
+                roads[["geometry"]],
+                grid_utm[["grid_id", "geometry"]],
+                how="intersection",
+                keep_geom_type=False,
+            )
+            if not road_join.empty:
+                road_join["road_seg_m"] = road_join.geometry.length
+                road_agg = road_join.groupby("grid_id")["road_seg_m"].sum()
+                out["road_length_m"] = out["grid_id"].map(road_agg).fillna(0.0)
+
+    def _area_ratio(layer: gpd.GeoDataFrame, out_col: str):
+        nonlocal out
+        if layer.empty:
+            return
+        layer = layer[layer.geometry.type.isin(["Polygon", "MultiPolygon"])].to_crs(grid_utm.crs).copy()
+        if layer.empty:
+            return
+        area_join = gpd.overlay(
+            layer[["geometry"]],
+            grid_utm[["grid_id", "geometry", "cell_area_m2"]],
+            how="intersection",
+            keep_geom_type=False,
+        )
+        if area_join.empty:
+            return
+        area_join["clip_area_m2"] = area_join.geometry.area
+        area_agg = area_join.groupby("grid_id")["clip_area_m2"].sum()
+        ratios = (area_agg / grid_utm.set_index("grid_id")["cell_area_m2"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out[out_col] = out["grid_id"].map(ratios).fillna(0.0).clip(0.0, 1.0)
+
+    _area_ratio(green, "green_ratio")
+    _area_ratio(water, "water_ratio")
+
+    print(
+        f"[LTE][OSM_CONTEXT] grid_rows={len(out)} roads={len(roads)} green={len(green)} water={len(water)} "
+        f"road_non_zero={int((pd.to_numeric(out['road_length_m'], errors='coerce').fillna(0) > 0).sum())} "
+        f"green_non_zero={int((pd.to_numeric(out['green_ratio'], errors='coerce').fillna(0) > 0).sum())} "
+        f"water_non_zero={int((pd.to_numeric(out['water_ratio'], errors='coerce').fillna(0) > 0).sum())}"
+    )
+    return out
+
+
+def _enrich_buildings_with_osm_heights(building_gdf: gpd.GeoDataFrame, mask_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    out = _normalize_building_height_gdf(building_gdf)
+    if mask_gdf.empty or ox is None:
+        return out
+
+    missing_height = out.empty or pd.to_numeric(out.get("building_height_m"), errors="coerce").isna().all()
+    if not missing_height:
+        return out
+
+    osm_buildings = _fetch_osm_features(mask_gdf, {"building": True})
+    if osm_buildings.empty:
+        return out
+
+    osm_buildings = _normalize_building_height_gdf(osm_buildings)
+    osm_buildings = osm_buildings[
+        osm_buildings.geometry.type.isin(["Polygon", "MultiPolygon"])
+        & osm_buildings.geometry.notnull()
+        & ~osm_buildings.geometry.is_empty
+    ].copy()
+    if osm_buildings.empty:
+        return out
+
+    height_series = pd.to_numeric(osm_buildings.get("building_height_m"), errors="coerce")
+    if height_series.notna().sum() == 0:
+        return out
+
+    if out.empty:
+        print(f"[LTE][OSM_BUILDING_HEIGHT] local_rows=0 osm_rows={len(osm_buildings)} height_rows={int(height_series.notna().sum())}")
+        return osm_buildings
+
+    utm_crs = _choose_utm_crs(mask_gdf)
+    local_utm = out.to_crs(utm_crs).copy()
+    osm_utm = osm_buildings.to_crs(utm_crs).copy()
+    local_utm["geometry"] = local_utm.geometry.centroid
+    osm_utm["geometry"] = osm_utm.geometry.centroid
+    osm_utm = osm_utm[height_series.notna().to_numpy()].copy()
+    if osm_utm.empty:
+        return out
+
+    joined = gpd.sjoin_nearest(
+        local_utm[["geometry"]],
+        osm_utm[["geometry", "building_height_m"]],
+        how="left",
+        distance_col="_height_match_m",
+        max_distance=35.0,
+    )
+    matched_heights = pd.to_numeric(joined["building_height_m"], errors="coerce")
+    matched_heights.index = out.index
+    out["building_height_m"] = pd.to_numeric(out.get("building_height_m"), errors="coerce")
+    out["building_height_m"] = out["building_height_m"].fillna(matched_heights)
+    print(
+        f"[LTE][OSM_BUILDING_HEIGHT] local_rows={len(out)} osm_rows={len(osm_buildings)} "
+        f"height_rows={int(pd.to_numeric(out['building_height_m'], errors='coerce').notna().sum())}"
+    )
+    return out
 
 
 def _safe_angle_delta_deg(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -876,9 +1037,11 @@ def build_grid_feature_frame(
 
     grid_df["lat"] = grid_centroids["lat"].values
     grid_df["lon"] = grid_centroids["lon"].values
-    grid_df["road_length_m"] = 0.0
-    grid_df["green_ratio"] = 0.0
-    grid_df["water_ratio"] = 0.0
+    for col in ["road_length_m", "green_ratio", "water_ratio"]:
+        if col not in grid_df.columns:
+            grid_df[col] = 0.0
+        else:
+            grid_df[col] = pd.to_numeric(grid_df[col], errors="coerce").fillna(0.0)
     grid_site_context = attach_site_context_features(grid_centroids[["grid_id", "lat", "lon"]], site_df).drop(
         columns=["lat", "lon"],
         errors="ignore",
@@ -1652,6 +1815,7 @@ def apply_full_display_correction(
         polygon_alignment = "fallback_from_points"
     building_gdf = building_df_to_gdf(building_df)
     building_gdf, building_alignment = align_building_geometries_to_project(building_gdf, polygon_gdf)
+    building_gdf = _enrich_buildings_with_osm_heights(building_gdf, polygon_gdf)
 
     tile_size_m = float(params.get("tile_size_m") or max(float(params.get("grid", 25.0)), DEFAULT_TILE_SIZE_M))
     cluster_count = int(params.get("cluster_count", 5))
@@ -1691,6 +1855,7 @@ def apply_full_display_correction(
 
     grid_gdf = create_analysis_grid(polygon_gdf, tile_size_m)
     grid_gdf = attach_building_features(grid_gdf, building_gdf)
+    grid_gdf = _attach_osm_context_features(grid_gdf, polygon_gdf)
     grid_df, _ = build_grid_feature_frame(grid_gdf, site_norm, cluster_count)
     grid_df, geo_status = augment_grid_with_advanced_geo_features(grid_df, building_gdf, site_norm, dem_raster_path=dem_raster_path)
     grid_gdf = grid_gdf.merge(grid_df[["grid_id", "clutter_class", "morphology_cluster"]], on="grid_id", how="left")

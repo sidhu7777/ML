@@ -18,11 +18,12 @@ def run_prediction():
             "project_id": int(data["project_id"]),
             "session_ids": data["session_ids"],
             "region": str(data.get("region", "india")).lower(),
-            "radius_m": float(data.get("radius", 500)),
+            "radius_m": float(data.get("radius", data.get("radius_m", 500))),
             "grid_resolution": float(data.get("grid_resolution", 25)),
             "building": bool(data.get("building", True)),
             "n_workers": int(data.get("n_workers", max(1, cpu_count - 1))),
             "max_interference_sites": int(data.get("max_interference_sites", 50)),
+            "dem_raster_path": data.get("dem_raster_path"),
             "output_folder": current_app.config['OUTPUT_FOLDER']
         }
 

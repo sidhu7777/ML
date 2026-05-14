@@ -927,12 +927,12 @@ def _create_analysis_grid(mask_gdf: gpd.GeoDataFrame, cell_size_m: float) -> gpd
 
 def _attach_building_features(grid_gdf: gpd.GeoDataFrame, building_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     grid_utm = grid_gdf.to_crs(_choose_utm_crs(grid_gdf))
-    grid_utm["building_count"] = 0
+    grid_utm["building_count"] = 0.0
     grid_utm["building_area_sum_m2"] = 0.0
+    grid_utm["avg_building_area_m2"] = 0.0
 
     if building_gdf.empty:
         grid_utm["building_area_ratio"] = 0.0
-        grid_utm["avg_building_area_m2"] = 0.0
         return grid_utm.to_crs("EPSG:4326")
 
     bld_utm = building_gdf.to_crs(grid_utm.crs).copy()
@@ -951,12 +951,24 @@ def _attach_building_features(grid_gdf: gpd.GeoDataFrame, building_gdf: gpd.GeoD
         building_area_sum_m2=("building_area_m2", "sum"),
         avg_building_area_m2=("building_area_m2", "mean"),
     )
-    grid_utm = grid_utm.merge(agg, on="grid_id", how="left", suffixes=("", "_agg"))
-    for col in ("building_count", "building_area_sum_m2", "avg_building_area_m2"):
-        grid_utm[col] = grid_utm[col].fillna(0)
+    agg = agg.rename(
+        columns={
+            "building_count": "building_count_calc",
+            "building_area_sum_m2": "building_area_sum_m2_calc",
+            "avg_building_area_m2": "avg_building_area_m2_calc",
+        }
+    )
+    grid_utm = grid_utm.merge(agg, on="grid_id", how="left")
+    grid_utm["building_count"] = pd.to_numeric(grid_utm["building_count_calc"], errors="coerce").fillna(0.0)
+    grid_utm["building_area_sum_m2"] = pd.to_numeric(grid_utm["building_area_sum_m2_calc"], errors="coerce").fillna(0.0)
+    grid_utm["avg_building_area_m2"] = pd.to_numeric(grid_utm["avg_building_area_m2_calc"], errors="coerce").fillna(0.0)
     grid_utm["building_area_ratio"] = (
         grid_utm["building_area_sum_m2"] / grid_utm["cell_area_m2"].replace(0, np.nan)
     ).fillna(0)
+    grid_utm = grid_utm.drop(
+        columns=["building_count_calc", "building_area_sum_m2_calc", "avg_building_area_m2_calc"],
+        errors="ignore",
+    )
     return grid_utm.to_crs("EPSG:4326")
 
 
@@ -1416,6 +1428,39 @@ def _ensure_required_building_source(
     if not normalized.empty:
         non_null_heights = pd.to_numeric(normalized.get("building_height_m", pd.Series(dtype=float)), errors="coerce").notna().mean()
         status["height_coverage_ratio"] = float(non_null_heights) if pd.notna(non_null_heights) else 0.0
+        if status["height_coverage_ratio"] > 0.0:
+            return normalized, status
+
+        osm_buildings = _fetch_osm_layer("buildings", polygon_gdf, BUILDING_TAGS, cache_dir)
+        osm_buildings = _normalize_building_height_gdf(osm_buildings)
+        osm_height_rows = pd.to_numeric(osm_buildings.get("building_height_m", pd.Series(dtype=float)), errors="coerce").notna().sum()
+        if osm_buildings.empty or int(osm_height_rows) == 0:
+            return normalized, status
+
+        utm_crs = _choose_utm_crs(polygon_gdf)
+        local_utm = normalized.to_crs(utm_crs).copy()
+        osm_utm = osm_buildings.to_crs(utm_crs).copy()
+        local_utm["geometry"] = local_utm.geometry.centroid
+        osm_utm["geometry"] = osm_utm.geometry.centroid
+        osm_utm = osm_utm[pd.to_numeric(osm_utm.get("building_height_m"), errors="coerce").notna()].copy()
+        if osm_utm.empty:
+            return normalized, status
+
+        joined = gpd.sjoin_nearest(
+            local_utm[["geometry"]],
+            osm_utm[["geometry", "building_height_m"]],
+            how="left",
+            distance_col="_height_match_m",
+            max_distance=35.0,
+        )
+        matched_heights = pd.to_numeric(joined["building_height_m"], errors="coerce")
+        matched_heights.index = normalized.index
+        normalized["building_height_m"] = pd.to_numeric(normalized.get("building_height_m"), errors="coerce")
+        normalized["building_height_m"] = normalized["building_height_m"].fillna(matched_heights)
+        non_null_heights = pd.to_numeric(normalized.get("building_height_m", pd.Series(dtype=float)), errors="coerce").notna().mean()
+        status["source"] = "db+osm_height_backfill"
+        status["fetched_from_osm"] = True
+        status["height_coverage_ratio"] = float(non_null_heights) if pd.notna(non_null_heights) else 0.0
         return normalized, status
 
     osm_buildings = _fetch_osm_layer("buildings", polygon_gdf, BUILDING_TAGS, cache_dir)
@@ -1639,9 +1684,10 @@ def _attach_line_density(grid_gdf: gpd.GeoDataFrame, line_gdf: gpd.GeoDataFrame,
         return grid_utm.to_crs("EPSG:4326")
 
     clipped[out_col] = clipped.geometry.length
-    agg = clipped.groupby("grid_id")[out_col].sum().reset_index()
-    grid_utm = grid_utm.merge(agg, on="grid_id", how="left", suffixes=("", "_agg"))
-    grid_utm[out_col] = grid_utm[out_col].fillna(0)
+    agg = clipped.groupby("grid_id")[out_col].sum().rename(f"{out_col}_calc").reset_index()
+    grid_utm = grid_utm.merge(agg, on="grid_id", how="left")
+    grid_utm[out_col] = pd.to_numeric(grid_utm[f"{out_col}_calc"], errors="coerce").fillna(0.0)
+    grid_utm = grid_utm.drop(columns=[f"{out_col}_calc"], errors="ignore")
     return grid_utm.to_crs("EPSG:4326")
 
 

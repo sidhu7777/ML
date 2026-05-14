@@ -101,7 +101,3 @@ do {
   $s
   Start-Sleep -Seconds 5
 } while ($s.status -ne "done" -and $s.status -ne "failed")
-
-
-
-
