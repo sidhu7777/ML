@@ -322,7 +322,10 @@ def fetch_optimized_sites(project_id, operator, region="india"):
 
     current_df = fetch_site_data(project_id, region=region, operator=operator)
     opt_df = _normalize_site_df(opt_raw, log_stage="OPTIMIZED_SITE_FETCH")
-    opt_df = opt_df.sort_values(["Node_Cell_ID"]).drop_duplicates(subset=["Node_Cell_ID"], keep="last")
+    sort_cols = [col for col in ["version", "updated_at", "created_at", "id", "Node_Cell_ID"] if col in opt_df.columns]
+    if sort_cols:
+        opt_df = opt_df.sort_values(sort_cols)
+    opt_df = opt_df.drop_duplicates(subset=["Node_Cell_ID"], keep="last")
 
     compare_cols = [
         "lat",
@@ -346,6 +349,7 @@ def fetch_optimized_sites(project_id, operator, region="india"):
             merged_df.loc[mask, col] = merged_df.loc[mask, "Node_Cell_ID"].astype(str).map(mapping)
 
     merged_df["optimization_applied"] = mask
+    changed_mask = _build_change_mask(merged_df)
     _print_fetch_summary(
         "OPTIMIZED_SITE_FETCH",
         "site_prediction_optimized",
@@ -354,6 +358,8 @@ def fetch_optimized_sites(project_id, operator, region="india"):
         extra={
             "optimized_rows": len(opt_df),
             "overlay_rows": int(mask.sum()),
+            "changed_rows": int(changed_mask.sum()),
+            "changed_cells": int(merged_df.loc[changed_mask, "Node_Cell_ID"].nunique()) if changed_mask.any() else 0,
             "distinct_pci": _safe_nunique(merged_df, "pci"),
             "distinct_cell_id": _safe_nunique(merged_df, "cell_id"),
             "distinct_nodeb_id": _safe_nunique(merged_df, "nodeb_id"),
@@ -416,8 +422,6 @@ def _build_change_mask(site_df):
         before = pd.to_numeric(site_df[orig_col], errors="coerce").fillna(-999999.0)
         after = pd.to_numeric(site_df[col], errors="coerce").fillna(-999999.0)
         changed_mask = changed_mask | (~np.isclose(before, after, equal_nan=True))
-    if "optimization_applied" in site_df.columns:
-        changed_mask = changed_mask | site_df["optimization_applied"].fillna(False).astype(bool)
     return changed_mask
 
 

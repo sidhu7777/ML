@@ -11,12 +11,9 @@ from .ml_engine import (
     fetch_baseline,
     fetch_site_data,
     fetch_optimized_sites,
-    build_runtime_optimized_sites,
-    compute_k1k2,
     compute_k1k2_for_cells,
     _compute_affected_cells,
     run_prediction_only_optimized,
-    replace_cells
 )
 
 # Global dictionary to track job status
@@ -186,31 +183,28 @@ class LTEPredictionService_optimised:
             site_df = fetch_site_data(project_id, region=region, operator=operator)
             _df_summary("SITE_DF", site_df)
 
-            use_runtime_change = bool(str(cfg.get("target_type", "")).strip()) and bool(str(cfg.get("target_id", "")).strip())
-            if use_runtime_change:
-                self._update(job_id, "running", "Applying runtime site change")
-                opt_sites = build_runtime_optimized_sites(site_df, cfg)
-            else:
-                self._update(job_id, "running", f"Loading optimized sites for {operator}")
-                opt_sites = fetch_optimized_sites(project_id, operator, region=region)
+            self._update(job_id, "running", f"Loading optimized sites for {operator}")
+            opt_sites = fetch_optimized_sites(project_id, operator, region=region)
+            if opt_sites.empty:
+                raise ValueError(
+                    f"No rows found in site_prediction_optimized for project_id={project_id} operator={operator}"
+                )
             _df_summary("OPTIMIZED_SITE_DF", opt_sites)
 
-            if use_runtime_change:
-                self._update(job_id, "running", "Calculating local K1/K2")
-                affected_cells, _, changed_rows = _compute_affected_cells(
-                    opt_sites,
-                    float(cfg.get("impact_radius_m", cfg.get("radius", 500))),
-                    int(cfg.get("neighbor_site_count", 2)),
-                )
-                calibration_cells = sorted(changed_rows["Node_Cell_ID"].astype(str).unique().tolist())
-                print(
-                    f"[LTE_OPT][K1K2_LOCAL_SCOPE] changed_cells={len(calibration_cells)} "
-                    f"affected_cells={len(affected_cells)} calibration_cells={calibration_cells}"
-                )
-                k1k2_map = compute_k1k2_for_cells(baseline_df, opt_sites, calibration_cells)
-            else:
-                self._update(job_id, "running", "Calculating K1/K2")
-                k1k2_map = compute_k1k2(baseline_df, site_df)
+            self._update(job_id, "running", "Calculating local K1/K2 from optimized DB changes")
+            affected_cells, _, changed_rows = _compute_affected_cells(
+                opt_sites,
+                float(cfg.get("impact_radius_m", cfg.get("radius", 500)) or cfg.get("radius", 500) or 500),
+                int(cfg.get("neighbor_site_count", 2) or 2),
+            )
+            calibration_cells = sorted(changed_rows["Node_Cell_ID"].astype(str).unique().tolist())
+            print(
+                f"[LTE_OPT][K1K2_LOCAL_SCOPE] changed_cells={len(calibration_cells)} "
+                f"affected_cells={len(affected_cells)} calibration_cells={calibration_cells}"
+            )
+            k1k2_map = compute_k1k2_for_cells(baseline_df, opt_sites, calibration_cells)
+            if not k1k2_map:
+                raise ValueError("No calibrated cells found from DB-driven optimized site changes")
 
             params = {
                 "radius": cfg.get("radius", 500),
@@ -224,9 +218,9 @@ class LTEPredictionService_optimised:
                 "project_id": project_id,
                 "region": region,
                 "baseline_job_id": baseline_job_id,
-                "impact_radius_m": cfg.get("impact_radius_m", cfg.get("radius", 500)),
-                "neighbor_site_count": cfg.get("neighbor_site_count", 2),
-                "max_interference_sites": cfg.get("max_interference_sites", 10),
+                "impact_radius_m": cfg.get("impact_radius_m", cfg.get("radius", 500) or 500),
+                "neighbor_site_count": cfg.get("neighbor_site_count", 2) or 2,
+                "max_interference_sites": cfg.get("max_interference_sites", 10) or 10,
             }
 
             self._update(job_id, "running", "Running prediction")
