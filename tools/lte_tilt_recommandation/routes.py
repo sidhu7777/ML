@@ -1,5 +1,7 @@
 import os
-from flask import Blueprint, request, jsonify, send_file
+import uuid
+from flask import Blueprint, request, jsonify, send_file, current_app
+from werkzeug.utils import secure_filename
 from .services import RFOptimizationService
 
 rf_optimization_bp = Blueprint("rf_optimization", __name__)
@@ -10,7 +12,18 @@ service = RFOptimizationService()
 # ==========================================================
 @rf_optimization_bp.route("/optimize", methods=["POST"])
 def run_optimized():
-    data = request.get_json()
+    if request.is_json:
+        data = request.get_json() or {}
+    else:
+        data = request.form.to_dict()
+        upload = request.files.get("file") or request.files.get("threshold_file")
+        if upload and upload.filename:
+            upload_dir = os.path.join(current_app.config["UPLOAD_FOLDER"], "tilt_thresholds")
+            os.makedirs(upload_dir, exist_ok=True)
+            safe_name = secure_filename(upload.filename) or f"tilt_threshold_{uuid.uuid4().hex}.csv"
+            saved_path = os.path.join(upload_dir, f"{uuid.uuid4().hex}_{safe_name}")
+            upload.save(saved_path)
+            data["threshold_file_path"] = saved_path
 
     # project_id is the only strictly required field
     required_fields = ["project_id"]

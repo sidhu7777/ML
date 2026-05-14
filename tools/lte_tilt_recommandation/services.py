@@ -5,9 +5,12 @@ import os
 import subprocess
 import datetime
 from sqlalchemy import create_engine, text
+from openpyxl import load_workbook
 
 # Global dictionary to track job status
 JOBS = {}
+DEFAULT_THRESHOLD_PROJECT_ID = 216
+DEFAULT_THRESHOLD_FILE = "lte_tilt_recommendation_transformed.csv"
 
 
 def _clean_id_series(series: pd.Series) -> pd.Series:
@@ -101,6 +104,221 @@ def _log_df(stage, df):
     for col in ["rsrp", "rsrq", "sinr", "pred_rsrp", "pred_rsrq", "pred_sinr"]:
         if col in df.columns:
             print(f"[TILT][{stage}] range_{col}={_safe_minmax(df, col)}")
+
+
+def _normalize_constraint_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if pd.isna(value):
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def _to_clean_cell_id(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return text[:-2] if text.endswith(".0") else text
+
+
+def _resolve_threshold_file_path(cfg: dict, project_id: int, project_root: str) -> str:
+    supplied = str(cfg.get("threshold_file_path", "") or cfg.get("threshold_file", "")).strip()
+    if supplied:
+        return supplied
+    if int(project_id) == DEFAULT_THRESHOLD_PROJECT_ID:
+        default_path = os.path.join(project_root, DEFAULT_THRESHOLD_FILE)
+        if os.path.exists(default_path):
+            return default_path
+    return ""
+
+
+def _load_constraint_df(file_path: str) -> pd.DataFrame:
+    if not file_path:
+        return pd.DataFrame()
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in {".xlsx", ".xls"}:
+        df = pd.read_excel(file_path)
+    else:
+        df = pd.read_csv(file_path)
+
+    df = df.copy()
+    df.columns = [str(col).strip() for col in df.columns]
+    lower_map = {str(col).strip().lower(): col for col in df.columns}
+    if "cell_id" not in lower_map:
+        raise ValueError("Constraint file must contain a cell_id column")
+
+    rename_map = {}
+    for required in [
+        "cell_id",
+        "min_m_tilt", "max_m_tilt",
+        "min_e_tilt", "max_e_tilt",
+        "min_height", "max_height",
+        "min_azimuth", "max_azimuth",
+        "min_tx_power", "max_tx_power",
+        "optimised",
+    ]:
+        if required in lower_map:
+            rename_map[lower_map[required]] = required
+    df = df.rename(columns=rename_map)
+    df["cell_id"] = df["cell_id"].map(_to_clean_cell_id)
+    if "optimised" not in df.columns:
+        df["optimised"] = False
+    df["optimised"] = df["optimised"].map(_normalize_constraint_bool)
+
+    numeric_cols = [
+        "min_m_tilt", "max_m_tilt",
+        "min_e_tilt", "max_e_tilt",
+        "min_height", "max_height",
+        "min_azimuth", "max_azimuth",
+        "min_tx_power", "max_tx_power",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.drop_duplicates(subset=["cell_id"], keep="last")
+    return df
+
+
+def _angular_distance_deg(a: float, b: float) -> float:
+    return abs((float(a) - float(b) + 180.0) % 360.0 - 180.0)
+
+
+def _azimuth_in_range(value: float, min_az: float, max_az: float) -> bool:
+    value = float(value) % 360.0
+    min_az = float(min_az) % 360.0
+    max_az = float(max_az) % 360.0
+    if min_az <= max_az:
+        return min_az <= value <= max_az
+    return value >= min_az or value <= max_az
+
+
+def _clamp_azimuth(value: float, min_az: float, max_az: float) -> float:
+    value = float(value) % 360.0
+    min_norm = float(min_az) % 360.0
+    max_norm = float(max_az) % 360.0
+    if _azimuth_in_range(value, min_norm, max_norm):
+        return value
+    return min_norm if _angular_distance_deg(value, min_norm) <= _angular_distance_deg(value, max_norm) else max_norm
+
+
+def _apply_constraint_ranges(reco_df: pd.DataFrame, constraint_df: pd.DataFrame) -> pd.DataFrame:
+    if reco_df.empty or constraint_df.empty:
+        return reco_df
+
+    out = reco_df.copy()
+    out["Cell ID"] = out["Cell ID"].map(_to_clean_cell_id)
+    constraint_map = constraint_df.set_index("cell_id").to_dict("index")
+
+    out["Constraint Applied"] = "No"
+    out["Constraint Source"] = ""
+    out["Allowed Min"] = pd.NA
+    out["Allowed Max"] = pd.NA
+
+    for idx, row in out.iterrows():
+        cell_id = _to_clean_cell_id(row.get("Cell ID"))
+        param = str(row.get("Parameter", "")).strip().lower()
+        cfg = constraint_map.get(cell_id)
+        if not cfg or not bool(cfg.get("optimised")):
+            continue
+
+        if param == "etilt":
+            min_col, max_col = "min_e_tilt", "max_e_tilt"
+            is_azimuth = False
+        elif param == "azimuth":
+            min_col, max_col = "min_azimuth", "max_azimuth"
+            is_azimuth = True
+        elif param in {"tx power", "power"}:
+            min_col, max_col = "min_tx_power", "max_tx_power"
+            is_azimuth = False
+        elif param in {"mechanical tilt", "mtilt"}:
+            min_col, max_col = "min_m_tilt", "max_m_tilt"
+            is_azimuth = False
+        elif param in {"height", "antenna height"}:
+            min_col, max_col = "min_height", "max_height"
+            is_azimuth = False
+        else:
+            continue
+
+        min_allowed = cfg.get(min_col)
+        max_allowed = cfg.get(max_col)
+        if pd.isna(min_allowed) or pd.isna(max_allowed):
+            continue
+
+        rec_value = pd.to_numeric(pd.Series([row.get("Recommended Value")]), errors="coerce").iloc[0]
+        if pd.isna(rec_value):
+            continue
+
+        constrained_value = rec_value
+        if is_azimuth:
+            constrained_value = _clamp_azimuth(rec_value, float(min_allowed), float(max_allowed))
+            changed = not _azimuth_in_range(rec_value, float(min_allowed), float(max_allowed))
+        else:
+            constrained_value = float(min(max(rec_value, float(min_allowed)), float(max_allowed)))
+            changed = not pd.isna(rec_value) and float(constrained_value) != float(rec_value)
+
+        out.at[idx, "Allowed Min"] = min_allowed
+        out.at[idx, "Allowed Max"] = max_allowed
+        out.at[idx, "Constraint Source"] = "cell_threshold_file"
+        if changed:
+            out.at[idx, "Recommended Value"] = constrained_value
+            out.at[idx, "Constraint Applied"] = "Yes"
+            existing_reason = str(row.get("Reason", "") or "").strip()
+            suffix = f" Recommended value constrained within configured range [{min_allowed}, {max_allowed}] for this cell."
+            out.at[idx, "Reason"] = (existing_reason + suffix).strip()
+    return out
+
+
+def _log_constraint_summary(raw_reco_df: pd.DataFrame, constrained_reco_df: pd.DataFrame, constraint_df: pd.DataFrame, threshold_file_path: str):
+    if constraint_df.empty:
+        print("[TILT][CONSTRAINT_APPLY] used=False reason=constraint_df_empty")
+        return
+
+    eligible_cells = int(constraint_df.loc[constraint_df["optimised"] == True, "cell_id"].nunique()) if "optimised" in constraint_df.columns else 0
+    eligible_rows = 0
+    if not raw_reco_df.empty and not constraint_df.empty:
+        optimised_cells = set(constraint_df.loc[constraint_df["optimised"] == True, "cell_id"].astype(str).tolist()) if "optimised" in constraint_df.columns else set()
+        eligible_rows = int(raw_reco_df["Cell ID"].map(_to_clean_cell_id).isin(optimised_cells).sum())
+
+    applied_rows = 0
+    if "Constraint Applied" in constrained_reco_df.columns:
+        applied_rows = int((constrained_reco_df["Constraint Applied"].astype(str).str.strip().str.lower() == "yes").sum())
+
+    print(
+        f"[TILT][CONSTRAINT_APPLY] used=True path={threshold_file_path} "
+        f"constraint_rows={len(constraint_df)} eligible_cells={eligible_cells} "
+        f"eligible_recommendation_rows={eligible_rows} applied_rows={applied_rows}"
+    )
+
+
+def _write_recommendations_back_to_workbook(output_file: str, reco_df: pd.DataFrame):
+    if reco_df.empty or not os.path.exists(output_file):
+        return
+    wb = load_workbook(output_file)
+    if "Recommendations" not in wb.sheetnames:
+        return
+    ws = wb["Recommendations"]
+    headers = [ws.cell(row=1, column=col_idx).value for col_idx in range(1, ws.max_column + 1)]
+    header_map = {str(header).strip(): idx for idx, header in enumerate(headers, start=1) if header is not None}
+    required_headers = [h for h in ["Recommended Value", "Reason"] if h not in header_map]
+    if required_headers:
+        return
+
+    optional_cols = ["Constraint Applied", "Allowed Min", "Allowed Max", "Constraint Source"]
+    next_col = ws.max_column + 1
+    for col in optional_cols:
+        if col not in header_map and col in reco_df.columns:
+            ws.cell(row=1, column=next_col, value=col)
+            header_map[col] = next_col
+            next_col += 1
+
+    for row_idx, (_, row) in enumerate(reco_df.iterrows(), start=2):
+        if row_idx > ws.max_row:
+            break
+        for col_name, value in row.items():
+            if col_name not in header_map:
+                continue
+            ws.cell(row=row_idx, column=header_map[col_name], value=None if pd.isna(value) else value)
+    wb.save(output_file)
 
 # ==========================================================
 # MULTI-REGION DATABASE ENGINES
@@ -284,6 +502,11 @@ class RFOptimizationService:
 
             scenario_id = self._get_next_scenario_id(project_id, current_engine)
             script_path = os.path.normpath(os.path.join(current_dir, "etilt_optimizer_cd2.py"))
+            threshold_file_path = _resolve_threshold_file_path(cfg, project_id, root_dir)
+            if threshold_file_path:
+                print(f"[TILT][CONSTRAINT_FILE] path={threshold_file_path}")
+            else:
+                print(f"[TILT][CONSTRAINT_FILE] path=n/a project_id={project_id}")
             
             process = subprocess.run(
                 ["python", script_path, log_csv, ant_csv, r_thresh, q_thresh, s_thresh, geo_csv],
@@ -304,6 +527,18 @@ class RFOptimizationService:
             
             output_file = os.path.join(temp_dir, "RF_Optimization_Report.xlsx")
             reco_df = pd.read_excel(output_file, sheet_name="Recommendations")
+            constraint_df = _load_constraint_df(threshold_file_path) if threshold_file_path else pd.DataFrame()
+            if not constraint_df.empty:
+                print(
+                    f"[TILT][CONSTRAINT_FETCH] rows={len(constraint_df)} "
+                    f"optimised_rows={int(constraint_df['optimised'].sum()) if 'optimised' in constraint_df.columns else 0}"
+                )
+                raw_reco_df = reco_df.copy()
+                reco_df = _apply_constraint_ranges(reco_df, constraint_df)
+                _log_constraint_summary(raw_reco_df, reco_df, constraint_df, threshold_file_path)
+                _write_recommendations_back_to_workbook(output_file, reco_df)
+            else:
+                print("[TILT][CONSTRAINT_APPLY] used=False reason=no_constraint_file_or_no_rows")
             _log_df("RECOMMENDATIONS_FETCH", reco_df)
             
             # Ensure "ALL" is replaced by the actual cell's operator
