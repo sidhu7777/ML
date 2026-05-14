@@ -133,14 +133,18 @@ class LTEPredictionService_optimised:
         job_id = str(uuid.uuid4())
         region = str(cfg.get("region", "india")).lower()
         scenario_id = cfg.get("scenario_id")
-        if scenario_id:
+        scenario_row_id = cfg.get("scenario_row_id")
+        if scenario_id and scenario_row_id:
             scenario_id = int(scenario_id)
+            scenario_row_id = int(scenario_row_id)
         else:
-            scenario_id = self._create_scenario(cfg, job_id, region)
+            scenario_row_id, scenario_id = self._create_scenario(cfg, job_id, region)
+            cfg["scenario_row_id"] = scenario_row_id
             cfg["scenario_id"] = scenario_id
 
         JOBS[job_id] = {
             "status": "queued",
+            "scenario_row_id": scenario_row_id,
             "scenario_id": scenario_id,
             "project_id": int(cfg["project_id"]),
         }
@@ -151,13 +155,14 @@ class LTEPredictionService_optimised:
             daemon=True
         ).start()
 
-        return {"job_id": job_id, "scenario_id": scenario_id}
+        return {"job_id": job_id, "scenario_id": scenario_id, "scenario_row_id": scenario_row_id}
 
     def get(self, job_id):
         return JOBS.get(job_id)
 
     def _run(self, job_id, cfg):
         scenario_id = cfg.get("scenario_id")
+        scenario_row_id = cfg.get("scenario_row_id")
         region = str(cfg.get("region", "india")).lower()
         try:
             print(
@@ -166,8 +171,8 @@ class LTEPredictionService_optimised:
                 f"radius={cfg.get('radius', 500)} grid_resolution={cfg.get('grid_resolution', 10)} "
                 f"n_workers={cfg.get('n_workers')}"
             )
-            if scenario_id:
-                self._update_scenario_status(int(scenario_id), "running", region=region, job_id=job_id)
+            if scenario_row_id:
+                self._update_scenario_status(int(scenario_row_id), "running", region=region, job_id=job_id)
             self._update(job_id, "running", "Loading baseline")
 
             project_id = cfg["project_id"]
@@ -244,15 +249,15 @@ class LTEPredictionService_optimised:
             JOBS[job_id]["output"] = file_path
             JOBS[job_id]["rows"] = len(optimized_df)
 
-            if scenario_id:
-                self._update_scenario_status(int(scenario_id), "done", region=region, job_id=job_id)
+            if scenario_row_id:
+                self._update_scenario_status(int(scenario_row_id), "done", region=region, job_id=job_id)
             self._update(job_id, "done", "Completed")
 
         except Exception as e:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = str(e)
-            if scenario_id:
-                self._update_scenario_status(int(scenario_id), "failed", region=region, job_id=job_id)
+            if scenario_row_id:
+                self._update_scenario_status(int(scenario_row_id), "failed", region=region, job_id=job_id)
             print(" ERROR:", traceback.format_exc())
 
     def _save_csv(self, df, project_id, operator):
@@ -336,11 +341,28 @@ class LTEPredictionService_optimised:
         JOBS[job_id]["progress"] = msg
         print(f"[{job_id[:6]}] {msg}")
 
+    def _get_next_project_scenario_id(self, project_id, current_engine):
+        query = text("""
+            SELECT COALESCE(MAX(scenario_id), 0) + 1
+            FROM lte_optimization_scenarios
+            WHERE project_id = :project_id
+        """)
+        with current_engine.connect() as conn:
+            next_id = conn.execute(query, {"project_id": int(project_id)}).scalar()
+        return int(next_id or 1)
+
     def _create_scenario(self, cfg, job_id, region):
         current_engine = _resolve_engine(region)
         baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(cfg["project_id"], region=region)
+        public_scenario_id = self._get_next_project_scenario_id(cfg["project_id"], current_engine)
+        if public_scenario_id > 6:
+            raise ValueError(
+                f"Maximum scenario limit reached for project_id={int(cfg['project_id'])}. "
+                f"Only 6 scenarios are allowed per project."
+            )
         payload = {
             "project_id": int(cfg["project_id"]),
+            "scenario_id": public_scenario_id,
             "baseline_job_id": baseline_job_id,
             "scenario_name": _build_scenario_name(cfg),
             "scenario_description": _build_scenario_description(cfg),
@@ -363,13 +385,13 @@ class LTEPredictionService_optimised:
         }
         insert_sql = text("""
             INSERT INTO lte_optimization_scenarios (
-                project_id, baseline_job_id, scenario_name, scenario_description,
+                project_id, scenario_id, baseline_job_id, scenario_name, scenario_description,
                 region, operator, target_type, target_id, impact_radius_m,
                 neighbor_site_count, max_interference_sites, delta_lat, delta_lon,
                 delta_azimuth, delta_electrical_tilt, delta_mechanical_tilt,
                 delta_tx_power, delta_antenna_height, status, created_by
             ) VALUES (
-                :project_id, :baseline_job_id, :scenario_name, :scenario_description,
+                :project_id, :scenario_id, :baseline_job_id, :scenario_name, :scenario_description,
                 :region, :operator, :target_type, :target_id, :impact_radius_m,
                 :neighbor_site_count, :max_interference_sites, :delta_lat, :delta_lon,
                 :delta_azimuth, :delta_electrical_tilt, :delta_mechanical_tilt,
@@ -378,21 +400,21 @@ class LTEPredictionService_optimised:
         """)
         with current_engine.begin() as conn:
             result = conn.execute(insert_sql, payload)
-            scenario_id = int(result.lastrowid)
+            scenario_row_id = int(result.lastrowid)
         print(
-            f"[LTE_OPT][SCENARIO_CREATE] scenario_id={scenario_id} job_id={job_id} "
+            f"[LTE_OPT][SCENARIO_CREATE] row_id={scenario_row_id} scenario_id={public_scenario_id} job_id={job_id} "
             f"name={payload['scenario_name']!r} description={payload['scenario_description']!r}"
         )
-        return scenario_id
+        return scenario_row_id, public_scenario_id
 
-    def _update_scenario_status(self, scenario_id, status, region="india", job_id=None):
+    def _update_scenario_status(self, scenario_row_id, status, region="india", job_id=None):
         current_engine = _resolve_engine(region)
         update_sql = text("""
             UPDATE lte_optimization_scenarios
             SET status = :status,
                 baseline_job_id = COALESCE(baseline_job_id, :baseline_job_id),
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = :scenario_id
+            WHERE id = :scenario_row_id
         """)
         baseline_job_id = None
         try:
@@ -405,7 +427,7 @@ class LTEPredictionService_optimised:
                 {
                     "status": status,
                     "baseline_job_id": baseline_job_id,
-                    "scenario_id": int(scenario_id),
+                    "scenario_row_id": int(scenario_row_id),
                 },
             )
-        print(f"[LTE_OPT][SCENARIO_STATUS] scenario_id={scenario_id} status={status}")
+        print(f"[LTE_OPT][SCENARIO_STATUS] row_id={scenario_row_id} status={status}")
